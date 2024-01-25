@@ -106,7 +106,7 @@ MK_NVCCFLAGS = -std=c++11
 ifdef LLAMA_FAST
 MK_CFLAGS     += -Ofast
 HOST_CXXFLAGS += -Ofast
-MK_NVCCFLAGS  += -O3
+MK_NVCCFLAGS  += -O3 --allow-unsupported-compiler
 else
 MK_CFLAGS     += -O3
 MK_CXXFLAGS   += -O3
@@ -386,8 +386,8 @@ ifdef LLAMA_CUBLAS
 	else
 		CUDA_PATH ?= /usr/local/cuda
 	endif
-	MK_CPPFLAGS  += -DGGML_USE_CUBLAS -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
-	MK_LDFLAGS   += -lcuda -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L/usr/lib/wsl/lib
+	MK_CPPFLAGS  += -DGGML_USE_CUBLAS -I/usr/local/cuda/include -I/opt/cuda/include -I$(CUDA_PATH)/targets/x86_64-linux/include -I/usr/local/cuda/targets/aarch64-linux/include -I$(CONDA_PREFIX)/include/
+	MK_LDFLAGS   += -lcuda -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib -L/usr/local/cuda/targets/aarch64-linux/lib -L/usr/lib/wsl/lib -L$(CONDA_PREFIX)/lib/
 	OBJS         += ggml-cuda.o
 	MK_NVCCFLAGS += -use_fast_math
 ifdef LLAMA_FATAL_WARNINGS
