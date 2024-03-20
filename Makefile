@@ -410,7 +410,7 @@ endif # LLAMA_DEBUG
 ifdef LLAMA_CUDA_NVCC
 	NVCC = $(CCACHE) $(LLAMA_CUDA_NVCC)
 else
-	NVCC = $(CCACHE) nvcc
+	NVCC = $(CCACHE) $(CUDA_PATH)/bin/nvcc
 endif #LLAMA_CUDA_NVCC
 ifdef CUDA_DOCKER_ARCH
 	MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
