@@ -1,6 +1,6 @@
 # Define the default target now so that it is always the first target
 BUILD_TARGETS = \
-	main quantize quantize-stats perplexity imatrix embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
+	main md-cli quantize quantize-stats perplexity imatrix embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
 	simple batched batched-bench save-load-state server gguf llama-bench libllava.a llava-cli baby-llama beam-search  \
 	speculative infill tokenize benchmark-matmult parallel finetune export-lora lookahead lookup passkey gritlm tests/test-c.o
 
@@ -411,7 +411,8 @@ endif # LLAMA_DEBUG
 ifdef LLAMA_CUDA_NVCC
 	NVCC = $(CCACHE) $(LLAMA_CUDA_NVCC)
 else
-	NVCC = $(CCACHE) nvcc
+	#NVCC = $(CCACHE) nvcc
+	NVCC = $(CCACHE) $(CUDA_PATH)/bin/nvcc
 endif #LLAMA_CUDA_NVCC
 ifdef CUDA_DOCKER_ARCH
 	MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
@@ -703,6 +704,14 @@ main: examples/main/main.cpp                                  ggml.o llama.o $(C
 	@echo
 	@echo '====  Run ./main -h for help.  ===='
 	@echo
+
+md-cli: examples/moondream/md-cli.cpp examples/moondream/vision_encoder.h examples/moondream/vision_encoder.cpp examples/moondream/moondream.h examples/moondream/moondream.cpp ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS)
+	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+	@echo
+	@echo '====  Run ./md-cli -h for help.  ===='
+	@echo
+
 
 infill: examples/infill/infill.cpp                            ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
