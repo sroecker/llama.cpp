@@ -4865,7 +4865,7 @@ static bool llm_load_tensors(
                     {
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                         if (model.arch != LLM_ARCH_MINICPM){
-                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, false);
+                            //model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, false);
                             // if output is NULL, init from the input tok embed
                             if (model.output == NULL) {
                                 model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -7001,7 +7001,7 @@ struct llm_build_context {
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm, NULL,
-                    LLM_NORM_RMS, cb, il);
+                    LLM_NORM_RMS, cb, il); // FIXME granite
             cb(cur, "attn_norm", il);
 
             // self-attention
@@ -7062,15 +7062,18 @@ struct llm_build_context {
             if (model.layers[il].ffn_gate_inp == nullptr) {
                 cur = llm_build_norm(ctx0, ffn_inp, hparams,
                         model.layers[il].ffn_norm, NULL,
-                        LLM_NORM_RMS, cb, il);
+                        LLM_NORM_RMS, cb, il); //FIXME Granite
                 cb(cur, "ffn_norm", il);
 
                 cur = llm_build_ffn(ctx0, cur,
-                        model.layers[il].ffn_up,   NULL,
-                        model.layers[il].ffn_gate, NULL,
-                        model.layers[il].ffn_down, NULL,
+                        //model.layers[il].ffn_up,   NULL,
+                        //model.layers[il].ffn_gate, NULL,
+                        //model.layers[il].ffn_down, NULL,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                        model.layers[il].ffn_gate, model.layers[il].ffn_gate_b,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                         NULL,
-                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il); // FIXME
                 cb(cur, "ffn_out", il);
             } else {
                 // MoE branch
