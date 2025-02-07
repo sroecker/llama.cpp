@@ -104,6 +104,7 @@ class Opt {
 
         ctx_params.n_batch        = context_size >= 0 ? context_size : context_size_default;
         ctx_params.n_ctx          = ctx_params.n_batch;
+        ctx_params.flash_attn     = flash_attn;
         model_params.n_gpu_layers = ngl >= 0 ? ngl : ngl_default;
         temperature               = temperature >= 0 ? temperature : temperature_default;
 
@@ -118,6 +119,7 @@ class Opt {
     int                  context_size = -1, ngl = -1;
     float                temperature = -1;
     bool                 verbose     = false;
+    bool                 flash_attn  = false;
 
   private:
     int   context_size_default = -1, ngl_default = -1;
@@ -165,6 +167,9 @@ class Opt {
                     return 1;
                 }
             } else if (options_parsing &&
+                parse_flag(argv, i, "-fa", "--flash-attn")) {
+                flash_attn = true;
+            } else if (options_parsing &&
                        (parse_flag(argv, i, "-v", "--verbose") || parse_flag(argv, i, "-v", "--log-verbose"))) {
                 verbose = true;
             } else if (options_parsing && strcmp(argv[i], "--jinja") == 0) {
@@ -209,6 +214,8 @@ class Opt {
             "      Context size (default: %d)\n"
             "  -n, -ngl, --ngl <value>\n"
             "      Number of GPU layers (default: %d)\n"
+            "  -fa, --flash-attn\n"
+            "      enable Flash Attention (default: disabled)"
             "  --temp <value>\n"
             "      Temperature (default: %.1f)\n"
             "  -v, --verbose, --log-verbose\n"
