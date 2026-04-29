@@ -89,6 +89,7 @@ regressed or failed to beat the current path.
 | 64-thread owner-computes-eight layout | 1249.85 pp tok/s, 35.05 tg tok/s | One thread per low-state group removes the exchange, but underutilizes the block badly. |
 | Low-state-major cost layout with 8-lane shuffle reduction | 1466.32 pp tok/s, 36.64 tg tok/s | Contiguous writes and one sync per step were not enough; reindexing plus subgroup shuffles were slower than the shared predecessor exchange. |
 | Hoist TCQ codebook value out of Viterbi loop | 1573.96 pp tok/s, 37.19 tg tok/s | Likely increased register pressure or defeated a better compiler choice. |
+| Drop common `xt*xt` term from Viterbi cost | 1569.00 to 1574.88 pp tok/s, 37.20 to 37.21 tg tok/s | Exact output symbols matched the baseline trace, but performance stayed within noise and was not a real improvement. |
 
 The graph bypass also showed an important constraint: the cache writes are still
 needed for subsequent decode, so simply consuming current K/V for attention does
@@ -152,6 +153,25 @@ Same-build smoke test result:
 PASS: output symbols match exactly for 32 calls / 128 captured groups
 x max abs diff: 0
 ```
+
+The common-term cost experiment also passed exact trace validation:
+
+```text
+PASS: output symbols match exactly for 32 calls / 128 captured groups
+x max abs diff: 0
+```
+
+It replaced `(xt - c)^2` with `c * (c - 2*xt)`, dropping the `xt*xt` term that
+is common to all states at a timestep. The symbol path stayed exact, but
+paired `pp15000/tg128` runs were noise-level:
+
+| State | pp15000 tok/s | tg128 tok/s |
+| --- | ---: | ---: |
+| Candidate run 1 | 1574.88 | 37.21 |
+| Baseline same-session run | 1571.56 | 37.21 |
+| Candidate run 2 | 1569.00 | 37.20 |
+
+The experiment was reverted.
 
 ## Likely next real optimization
 
