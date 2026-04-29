@@ -3,6 +3,7 @@
 #include "turbo-quant-cuda.cuh"
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 
 static void load_turbo4_alpha(int device) {
     static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
@@ -136,6 +137,182 @@ static void init_tcq_error_dump(int device) {
     cudaMemcpyToSymbol(d_tcq_dump_max, &n, sizeof(int));
     atexit(tcq_error_dump_flush);
     fprintf(stderr, "TCQ: will dump errors for first %d groups to /tmp/tcq_errors.bin\n", n);
+}
+
+// TCQ validation trace (TURBO_TCQ_DUMP_TRACE=CALLS:GROUPS)
+// Captures a call-indexed dump so optimization runs can be compared without
+// cross-layer or K/V overwrite races.
+struct tcq_trace_header {
+    uint32_t magic;
+    int32_t  version;
+    int32_t  calls;
+    int32_t  groups;
+    int32_t  elements;
+};
+
+struct tcq_trace_call_meta {
+    int32_t type;
+    int32_t is_k;
+    int32_t captured_groups;
+    int32_t flags;
+    int64_t ne_total_groups;
+    int64_t ne00;
+    int64_t ne01;
+    int64_t ne02;
+    int64_t ne03;
+    char    name[64];
+};
+
+static_assert(sizeof(tcq_trace_header) == 20, "unexpected TCQ trace header size");
+static_assert(sizeof(tcq_trace_call_meta) == 120, "unexpected TCQ trace metadata size");
+
+static constexpr uint32_t TCQ_TRACE_MAGIC   = 0x31514354; // "TCQ1"
+static constexpr int32_t  TCQ_TRACE_VERSION = 1;
+
+static int tcq_trace_calls = 0;
+static int tcq_trace_groups = 0;
+static int tcq_trace_next_call = 0;
+static int tcq_trace_device = -1;
+static const char * tcq_trace_path = "/tmp/tcq_trace.bin";
+static float * tcq_trace_x_host = nullptr;
+static uint8_t * tcq_trace_out_host = nullptr;
+static float * tcq_trace_x_dev = nullptr;
+static uint8_t * tcq_trace_out_dev = nullptr;
+static tcq_trace_call_meta * tcq_trace_meta = nullptr;
+
+static bool parse_tcq_trace_shape(const char * s, int & calls, int & groups) {
+    if (!s) return false;
+
+    char * end = nullptr;
+    errno = 0;
+    const long parsed_calls = strtol(s, &end, 10);
+    if (end == s || errno != 0 || parsed_calls <= 0 || parsed_calls > 1000000) return false;
+    if (*end != ':' && *end != ',' && *end != 'x' && *end != 'X') return false;
+
+    const char * group_start = end + 1;
+    errno = 0;
+    const long parsed_groups = strtol(group_start, &end, 10);
+    if (end == group_start || errno != 0 || parsed_groups <= 0 || parsed_groups > 1000000) return false;
+    if (*end != '\0') return false;
+
+    const int64_t total = (int64_t) parsed_calls * parsed_groups;
+    if (total <= 0 || total > 500000) return false;
+
+    calls = (int) parsed_calls;
+    groups = (int) parsed_groups;
+    return true;
+}
+
+static void tcq_trace_flush() {
+    if (tcq_trace_calls == 0 || tcq_trace_device < 0) return;
+
+    const int captured_calls = tcq_trace_next_call < tcq_trace_calls ? tcq_trace_next_call : tcq_trace_calls;
+    if (captured_calls <= 0) return;
+
+    ggml_cuda_set_device(tcq_trace_device);
+    cudaDeviceSynchronize();
+
+    const size_t n_values = (size_t) captured_calls * tcq_trace_groups * 128;
+    cudaMemcpy(tcq_trace_x_host, tcq_trace_x_dev, n_values * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tcq_trace_out_host, tcq_trace_out_dev, n_values * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+    FILE * f = fopen(tcq_trace_path, "wb");
+    if (f) {
+        const tcq_trace_header header = {
+            TCQ_TRACE_MAGIC,
+            TCQ_TRACE_VERSION,
+            captured_calls,
+            tcq_trace_groups,
+            128,
+        };
+        fwrite(&header, sizeof(header), 1, f);
+        fwrite(tcq_trace_meta, sizeof(tcq_trace_call_meta), captured_calls, f);
+        fwrite(tcq_trace_x_host, sizeof(float), n_values, f);
+        fwrite(tcq_trace_out_host, sizeof(uint8_t), n_values, f);
+        fclose(f);
+        fprintf(stderr, "TCQ trace: dumped %d calls x %d groups to %s\n",
+                captured_calls, tcq_trace_groups, tcq_trace_path);
+        if (tcq_trace_next_call > tcq_trace_calls) {
+            fprintf(stderr, "TCQ trace: truncated %d additional calls\n",
+                    tcq_trace_next_call - tcq_trace_calls);
+        }
+    }
+
+    cudaFree(tcq_trace_x_dev);
+    cudaFree(tcq_trace_out_dev);
+    free(tcq_trace_x_host);
+    free(tcq_trace_out_host);
+    free(tcq_trace_meta);
+}
+
+static void init_tcq_trace_dump(int device) {
+    static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
+    if (loaded[device]) return;
+    loaded[device] = true;
+
+    const char * s = getenv("TURBO_TCQ_DUMP_TRACE");
+    if (!s) return;
+
+    int calls = 0;
+    int groups = 0;
+    if (!parse_tcq_trace_shape(s, calls, groups)) {
+        fprintf(stderr, "TCQ trace: invalid TURBO_TCQ_DUMP_TRACE='%s', expected CALLS:GROUPS with CALLS*GROUPS <= 500000\n", s);
+        return;
+    }
+
+    if (tcq_trace_device >= 0) {
+        return;
+    }
+
+    const char * path = getenv("TURBO_TCQ_DUMP_TRACE_PATH");
+    if (path && path[0] != '\0') {
+        tcq_trace_path = path;
+    }
+
+    tcq_trace_calls = calls;
+    tcq_trace_groups = groups;
+    tcq_trace_device = device;
+
+    const size_t n_values = (size_t) calls * groups * 128;
+    tcq_trace_x_host = (float *) malloc(n_values * sizeof(float));
+    tcq_trace_out_host = (uint8_t *) malloc(n_values * sizeof(uint8_t));
+    tcq_trace_meta = (tcq_trace_call_meta *) calloc((size_t) calls, sizeof(tcq_trace_call_meta));
+    cudaMalloc(&tcq_trace_x_dev, n_values * sizeof(float));
+    cudaMalloc(&tcq_trace_out_dev, n_values * sizeof(uint8_t));
+    cudaMemset(tcq_trace_x_dev, 0, n_values * sizeof(float));
+    cudaMemset(tcq_trace_out_dev, 0, n_values * sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_tcq_trace_x_buf, &tcq_trace_x_dev, sizeof(float *));
+    cudaMemcpyToSymbol(d_tcq_trace_out_buf, &tcq_trace_out_dev, sizeof(uint8_t *));
+    cudaMemcpyToSymbol(d_tcq_trace_calls, &tcq_trace_calls, sizeof(int));
+    cudaMemcpyToSymbol(d_tcq_trace_groups, &tcq_trace_groups, sizeof(int));
+    atexit(tcq_trace_flush);
+    fprintf(stderr, "TCQ trace: will dump %d calls x %d groups to %s\n", calls, groups, tcq_trace_path);
+}
+
+static int tcq_trace_begin_call(
+        int device, const ggml_tensor * dst, int is_k, int64_t ne_total_groups,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03) {
+    if (tcq_trace_calls == 0 || device != tcq_trace_device) return -1;
+
+    const int call_id = tcq_trace_next_call++;
+    if (call_id >= tcq_trace_calls) return -1;
+
+    tcq_trace_call_meta & meta = tcq_trace_meta[call_id];
+    meta.type = (int32_t) dst->type;
+    meta.is_k = is_k;
+    meta.captured_groups = ne_total_groups < tcq_trace_groups ? (int32_t) ne_total_groups : (int32_t) tcq_trace_groups;
+    meta.flags = 0;
+    meta.ne_total_groups = ne_total_groups;
+    meta.ne00 = ne00;
+    meta.ne01 = ne01;
+    meta.ne02 = ne02;
+    meta.ne03 = ne03;
+    memset(meta.name, 0, sizeof(meta.name));
+    for (size_t i = 0; i + 1 < sizeof(meta.name) && dst->name[i] != '\0'; i++) {
+        meta.name[i] = dst->name[i];
+    }
+
+    return call_id;
 }
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
@@ -523,6 +700,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
                 load_tcq_norm_alpha(ctx.device);
                 init_tcq_error_dump(ctx.device);
+                init_tcq_trace_dump(ctx.device);
             }
         }
         // TCQ Viterbi encode: 512 threads per block. The TCQ3 backtrace stores
@@ -560,9 +738,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq3_use_shared_bt[ctx.device] ? tcq3_bt_shared_bytes : 0;
+            const int trace_call_id = tcq_trace_begin_call(ctx.device, dst, iq_is_k, ne_total_groups, ne00, ne01, ne02, ne03);
             k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], trace_call_id, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
@@ -589,6 +768,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
                 load_tcq_norm_alpha(ctx.device);
                 init_tcq_error_dump(ctx.device);
+                init_tcq_trace_dump(ctx.device);
             }
         }
         // 2-bit TCQ Viterbi encode: 256 threads per block. Compressed backtrace
@@ -623,9 +803,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq2_use_shared_bt[ctx.device] ? tcq2_bt_shared_bytes : 0;
+            const int trace_call_id = tcq_trace_begin_call(ctx.device, dst, iq_is_k, ne_total_groups, ne00, ne01, ne02, ne03);
             k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], tcq2_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq2_use_shared_bt[ctx.device], trace_call_id, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }

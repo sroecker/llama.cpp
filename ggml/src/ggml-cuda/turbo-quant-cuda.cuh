@@ -32,6 +32,12 @@ static __device__ float   * d_tcq_dump_x_buf   = nullptr; // [max_groups][128] o
 static __device__ uint8_t * d_tcq_dump_out_buf  = nullptr; // [max_groups][128] output symbols
 static __device__ int       d_tcq_dump_max      = 0;       // max groups to dump (0 = disabled)
 
+// Non-racy TCQ validation trace: save [call][group][128] values and symbols.
+static __device__ float   * d_tcq_trace_x_buf   = nullptr;
+static __device__ uint8_t * d_tcq_trace_out_buf = nullptr;
+static __device__ int       d_tcq_trace_calls   = 0;
+static __device__ int       d_tcq_trace_groups  = 0;
+
 // === Post-FWHT data extraction for empirical codebook computation ===
 // Enabled by TURBO_EXTRACT=<max_samples> env var (e.g. TURBO_EXTRACT=2000000)
 // Dumps post-rotation normalized values to /tmp/turbo_postrot.bin (float32)
@@ -698,6 +704,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
         const int use_shared_bt,
+        const int trace_call_id,
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -895,6 +902,11 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     // Save x[] to global buffer before backtrack overwrites it
     if (d_tcq_dump_max > 0 && group < d_tcq_dump_max && sid < 128)
         d_tcq_dump_x_buf[group * 128 + sid] = x[sid];
+    if (trace_call_id >= 0 && trace_call_id < d_tcq_trace_calls &&
+            group < d_tcq_trace_groups && sid < 128) {
+        const int64_t trace_idx = ((int64_t) trace_call_id * d_tcq_trace_groups + group) * 128 + sid;
+        d_tcq_trace_x_buf[trace_idx] = x[sid];
+    }
 
     // Backtrack (inherently sequential, reads global bt)
     uint8_t * outputs = (uint8_t *)x;
@@ -912,6 +924,11 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     // Save output symbols to global buffer
     if (d_tcq_dump_max > 0 && group < d_tcq_dump_max && sid < 128)
         d_tcq_dump_out_buf[group * 128 + sid] = outputs[sid];
+    if (trace_call_id >= 0 && trace_call_id < d_tcq_trace_calls &&
+            group < d_tcq_trace_groups && sid < 128) {
+        const int64_t trace_idx = ((int64_t) trace_call_id * d_tcq_trace_groups + group) * 128 + sid;
+        d_tcq_trace_out_buf[trace_idx] = outputs[sid];
+    }
 
     // Parallel recon norm: t>=2 can compute state directly from 3 outputs (3 shifts of 3 = 9 bits)
     float my_recon_sq = 0.0f;
@@ -1054,6 +1071,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         block_turbo2_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
         const int use_shared_bt,
+        const int trace_call_id,
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -1243,6 +1261,11 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     // Save x[] to global buffer before backtrack overwrites it
     if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
         d_tcq_dump_x_buf[grp * 128 + sid] = x[sid];
+    if (trace_call_id >= 0 && trace_call_id < d_tcq_trace_calls &&
+            grp < d_tcq_trace_groups && sid < 128) {
+        const int64_t trace_idx = ((int64_t) trace_call_id * d_tcq_trace_groups + grp) * 128 + sid;
+        d_tcq_trace_x_buf[trace_idx] = x[sid];
+    }
 
     // Backtrack (inherently sequential, reads compressed bt)
     uint8_t * outputs = (uint8_t *)x;
@@ -1260,6 +1283,11 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     // Save output symbols to global buffer
     if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
         d_tcq_dump_out_buf[grp * 128 + sid] = outputs[sid];
+    if (trace_call_id >= 0 && trace_call_id < d_tcq_trace_calls &&
+            grp < d_tcq_trace_groups && sid < 128) {
+        const int64_t trace_idx = ((int64_t) trace_call_id * d_tcq_trace_groups + grp) * 128 + sid;
+        d_tcq_trace_out_buf[trace_idx] = outputs[sid];
+    }
 
     // Parallel recon norm: t>=3 can compute state directly from 4 outputs (4 shifts of 2 = 8 bits)
     float my_recon_sq = 0.0f;
