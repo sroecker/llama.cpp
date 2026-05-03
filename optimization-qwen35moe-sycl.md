@@ -755,6 +755,8 @@ Screened candidates:
 | Weighted-sum Q3_K/Q5_K local reduction, one workgroup containing all active-expert subgroups for one row | `522.07 +/- 0.95` | `15.25 +/- 0.01` | `499.13 +/- 0.20` | `15.10 +/- 0.03` | Reject. Removed global atomics but still did not improve decode. |
 | Non-weighted Q5_K MoE MMVQ with `ROWS_PER_WG=4` | not run | not run | `495.84 +/- 1.88` | `15.14 +/- 0.03` | Reject. Tiny decode movement with prompt regression. |
 | Non-weighted Q5_K MoE MMVQ with `ROWS_PER_WG=2` | `510.57 +/- 0.93` | `15.01 +/- 0.06` | `498.14 +/- 0.69` | `15.15 +/- 0.01` | Reject. Balanced decode was slightly higher, but Mini regressed in the final cleaned-state check. |
+| Weighted-sum register-private `EXPERT_TILE=2` with one final subgroup reduction | `521.68 +/- 0.09` | `15.22 +/- 0.02` | not run | not run | Reject. Keeps one subgroup per row and avoids SLM/atomics, but two-expert interleaving still regressed Mini decode. |
+| Weighted-sum register-private `EXPERT_TILE=1` with one final subgroup reduction | `521.15 +/- 0.74` | `15.34 +/- 0.02` | `478.19 +/- 1.18` | `14.88 +/- 0.03` | Reject. Mini was neutral, but Balanced regressed badly; per-expert subgroup reductions are better for Q5_K Balanced. |
 
 Validation while screening:
 
@@ -765,7 +767,7 @@ Validation while screening:
 | `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p 'type_a=q5_K'` | `2/2 tests passed` for Q5_K row grouping |
 | `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p 'type_a=q[35]_K'` | `4/4 tests passed` for weighted-sum screens' related non-weighted coverage |
 
-Finding: simply increasing scheduled expert/row granularity is not enough for this workload. The weighted-sum variants create extra synchronization, local-memory, atomic, or zeroing cost, and the Q5_K row-grouping variants are too small to justify keeping when Mini safety is considered. All active-expert scheduling source changes from this section were backed out; keep the previous VDR/fusion commits as the current best local state.
+Finding: simply increasing scheduled expert/row granularity is not enough for this workload. The weighted-sum variants create extra synchronization, local-memory, atomic, or zeroing cost, and the Q5_K row-grouping variants are too small to justify keeping when Mini safety is considered. The later register-private tests show that even removing repeated subgroup reductions is not universally better: Mini tolerates a single final reduction, but Balanced/Q5_K strongly prefers the original per-expert reduction order. All active-expert scheduling and expert-tiling source changes from this section were backed out; keep the previous VDR/fusion commits as the current best local state.
 
 ## Local-only flag candidates
 
