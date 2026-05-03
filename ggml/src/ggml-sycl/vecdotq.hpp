@@ -229,7 +229,7 @@ static __dpct_inline__ float vec_dot_q4_K_q8_1_impl_vmmq(
 }
 
 
-#define VDR_Q5_K_Q8_1_MMVQ 2
+#define VDR_Q5_K_Q8_1_MMVQ 4
 
 // contiguous v/x values
 static __dpct_inline__ float vec_dot_q5_K_q8_1_impl_vmmq(
@@ -1033,8 +1033,8 @@ static __dpct_inline__ float vec_dot_q4_K_q8_1(const void * __restrict__ vbq, co
 }
 
 static __dpct_inline__ float
-vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
-                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+vec_dot_q5_K_q8_1_vdr2(const void *__restrict__ vbq,
+                       const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
 
 #ifndef GGML_QKK_64
     const block_q5_K * bq5_K = (const block_q5_K *) vbq;
@@ -1120,6 +1120,19 @@ vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
 #endif // __SYCL_ARCH__ >= VER_4VEC
 
 #endif
+}
+
+static __dpct_inline__ float
+vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
+                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    static_assert(VDR_Q5_K_Q8_1_MMVQ % 2 == 0, "Q5_K MMVQ VDR must be a multiple of the 2-wide dot body");
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_K_Q8_1_MMVQ; i += 2) {
+        sum += vec_dot_q5_K_q8_1_vdr2(vbq, bq8_1, iqs + i);
+    }
+    return sum;
 }
 
 static __dpct_inline__ float

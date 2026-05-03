@@ -546,3 +546,96 @@ Correctness / validation after final VDR settings:
 | `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
 
 Interpretation: Q3_K and Q6_K VDR tuning clears the remaining Q3/MMVQ and Q6 output-projection candidates from the previous VTune list and gives another measured `tg128` gain over the already optimized branch. The main visible next candidates are now the residual Q3_K fused MoE kernel, flash-attention tile occupancy, and small `op_mul` broadcasts.
+
+### Balanced GGUF two-GPU baseline
+
+Goal: check whether `Qwen3.6-35B-A3B-APEX-Balanced.gguf` is viable now that two GPUs are available.
+
+Before measurement, the rough estimate based on local GGUF size was pessimistic:
+
+| file | cached size |
+| --- | ---: |
+| `Qwen3.6-35B-A3B-APEX-I-Mini.gguf` | `14G` |
+| `Qwen3.6-35B-A3B-APEX-Balanced.gguf` | `24G` |
+
+Initial estimate: `pp4096 300-360` t/s and `tg512 8.8-10.5` t/s, with a less pessimistic upper case around `pp4096 380` and `tg512 11-12` if the larger file did not scale the active decode path linearly.
+
+Measured command:
+
+```sh
+./build-f16/bin/llama-bench -r 3 -p 4096 -n 512 \
+  -ctk q8_0 -ctv q8_0 -dev SYCL0/SYCL1 \
+  -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-Balanced.gguf -fa 1 -ngl 99
+```
+
+Measured result:
+
+| model | size | weights | `pp4096` | `tg512` |
+| --- | ---: | --- | ---: | ---: |
+| `Qwen3.6-35B-A3B-APEX-Balanced.gguf` | `23.85 GiB` | `Q5_K - Medium` | `474.84 +/- 0.65` | `15.01 +/- 0.03` |
+| `Qwen3.6-35B-A3B-APEX-I-Mini.gguf` final local build | `14G cached` | mixed lower quant | `519.21 +/- 0.56` | `15.34 +/- 0.00` |
+
+Interpretation:
+
+- Balanced prompt processing is slower than Mini by about `8.5%`, but decode is only about `2.2%` slower than the current optimized Mini result.
+- The file-size-based estimate was too pessimistic for decode. Treat Balanced as a viable two-GPU candidate.
+- The next Balanced tests should focus on runtime flags first, because the existing decode fusions already carry over and the remaining gap may be split / cache / batching related.
+
+### Balanced Q5_K MMVQ VDR tuning
+
+Goal: apply the same MMVQ-style VDR tuning used for the lower-quant Mini path to Balanced's `Q5_K - Medium` weights.
+
+Implementation note:
+
+- The existing Q5_K MMVQ dot body already represented a 2-wide chunk.
+- The accepted experiment keeps that body as `vec_dot_q5_K_q8_1_vdr2` and makes `VDR_Q5_K_Q8_1_MMVQ = 4` sum two adjacent 2-wide chunks.
+- This is narrower than changing scheduling or adding a new op; only the Q5_K MMVQ dot granularity changes.
+
+Screened results on the Balanced two-GPU q8 KV target:
+
+| Q5_K MMVQ setting | `pp4096` | `tg512` | decision |
+| --- | ---: | ---: | --- |
+| VDR=2 baseline | `474.84 +/- 0.65` | `15.01 +/- 0.03` | Baseline |
+| VDR=4 | `497.90 +/- 0.40` | `15.11 +/- 0.03` | Keep |
+| VDR=8 | `459.45 +/- 0.10` | `15.08 +/- 0.01` | Reject; prompt regressed and decode did not beat VDR=4 |
+
+Accepted improvement:
+
+| metric | baseline | VDR=4 | improvement |
+| --- | ---: | ---: | ---: |
+| `pp4096` | `474.84 +/- 0.65` | `497.90 +/- 0.40` | `+4.9%` |
+| `tg512` | `15.01 +/- 0.03` | `15.11 +/- 0.03` | `+0.7%` |
+
+Validation for the VDR=4 candidate:
+
+| validation | result |
+| --- | --- |
+| `cmake --build build-f16 --target llama-bench test-backend-ops -j6` | passed |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT -b SYCL0` | `911/911 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0` | `690/690 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+
+Interpretation: Q5_K behaves differently from the lower-quant Mini path. VDR=4 is useful, but mostly for prompt throughput; decode is only slightly better. VDR=8 appears to create too much per-lane work or register pressure for this shape.
+
+### Local-only flag candidates
+
+These flags are useful for local performance testing and do not imply upstreamable code changes.
+
+Recommended next test order:
+
+| area | flags | purpose |
+| --- | --- | --- |
+| KV cache type | `-ctk q8_0 -ctv q8_0`, `-ctk q4_0 -ctv q4_0`, `-ctk f16 -ctv f16` | Check whether Balanced decode is cache bandwidth, precision, or occupancy limited at longer contexts. |
+| Split mode | `-sm layer`, `-sm row`, `-sm tensor` | Test whether decode benefits from row/tensor splitting instead of default layer splitting on two A770s. |
+| Tensor split | `-ts 1/1`, then skewed splits such as `-ts 0.45/0.55` and `-ts 0.4/0.6` | Check whether giving slightly more work to the faster decode GPU improves dual-GPU generation. |
+| Main GPU | `-mg 0`, `-mg 1` | Relevant when row split or tensor split changes where intermediate work lands. |
+| Batch sizing | `-b 1024`, `-b 2048`, `-b 4096`; `-ub 256`, `-ub 512`, `-ub 1024` | Tune prompt throughput and see whether decode-side launch packing changes. |
+| Flash attention | `-fa 1`, `-fa 0` | Keep `-fa 1` as default, but use `-fa 0` as a diagnostic for FA selector and KV-cache interactions. |
+| Memory fit | `-fitt 512`, `-fitt 1024`, `-fitc 4096`, `-fitc 8192` | Find practical local memory ceilings and prevent accidental host spillover. |
+| Host buffer avoidance | `--no-host` | Force failure instead of hidden host-buffer use; useful for reproducible GPU-only timing. |
+| Op offload diagnostic | `-nopo 1` | Check whether tiny offloaded ops are hurting elapsed time. This is diagnostic, not a likely final setting. |
+| KV offload diagnostic | `-nkvo 1` | Quantifies the cost of moving KV cache off GPU. Expected to be slower, but useful as a bound. |
+| MoE CPU fallback | `-ncmoe` | Memory fallback only. Expected to hurt throughput for these GPU-focused tests. |
+
+For realistic interactive testing with `llama-cli`, also use `--offline` to avoid Hub checks and `--perf` to collect timing output. `llama-cli` exposes runtime flags such as `--no-repack`, `--op-offload`, `--no-op-offload`, and speculative decoding options that are not part of the current `llama-bench` loop.
