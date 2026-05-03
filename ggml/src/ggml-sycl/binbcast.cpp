@@ -85,6 +85,13 @@ static void k_bin_bcast_unravel(const src0_t * src0, const src1_t * src1, dst_t 
     dst_row[i0] = (dst_t)bin_op(src0 ? (float)src0_row[i0*s00] : 0.0f, (float)src1_row[i10*s10]);
 }
 
+static void k_mul_scalar_add_f32(const float * mul_src, const float * scalar_src, const float * add_src,
+                                 float * dst, const int64_t n, const sycl::nd_item<1> & item_ct1) {
+    const float scale = scalar_src[0];
+    for (int64_t i = item_ct1.get_global_id(0); i < n; i += item_ct1.get_global_range(0)) {
+        dst[i] = add_src[i] + mul_src[i] * scale;
+    }
+}
 
 template<float (*bin_op)(const float, const float)>
 struct bin_bcast_sycl {
@@ -334,6 +341,34 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_op_mul(ctx, dst);
 }
 
+void ggml_sycl_mul_scalar_add(ggml_backend_sycl_context & ctx, const ggml_tensor * mul_src,
+                              const ggml_tensor * scalar_src, const ggml_tensor * add_src, ggml_tensor * dst) {
+    GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(scalar_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(scalar_src) == 1);
+    GGML_ASSERT(ggml_are_same_shape(mul_src, add_src));
+    GGML_ASSERT(ggml_are_same_shape(mul_src, dst));
+    GGML_ASSERT(ggml_is_contiguous(mul_src));
+    GGML_ASSERT(ggml_is_contiguous(add_src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+
+    const int64_t n = ggml_nelements(dst);
+    const size_t local = 256;
+    const size_t num_blocks = ((size_t) n + local - 1) / local;
+    dpct::queue_ptr stream = ctx.stream();
+
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(num_blocks * local), sycl::range<1>(local)),
+        [=](sycl::nd_item<1> item_ct1) {
+            k_mul_scalar_add_f32((const float *) mul_src->data, (const float *) scalar_src->data,
+                                 (const float *) add_src->data, (float *) dst->data, n, item_ct1);
+        });
+}
+
 void ggml_sycl_div(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_div(ctx, dst);
@@ -343,4 +378,3 @@ void ggml_sycl_repeat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_repeat(ctx, dst);
 }
-

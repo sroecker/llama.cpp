@@ -4708,6 +4708,138 @@ static void ggml_sycl_moe_weighted_sum(
     });
 }
 
+static bool ggml_sycl_try_rms_norm_mul(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
+    ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    if (rms_norm->op != GGML_OP_RMS_NORM || rms_norm->type != GGML_TYPE_F32 ||
+        rms_norm->src[0] == nullptr || rms_norm->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((rms_norm->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+
+    int mul_idx = node_idx + 1;
+    ggml_tensor * mul = ggml_sycl_next_compute_node(cgraph, mul_idx, mul_idx);
+    if (mul == nullptr || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(rms_norm, mul)) {
+        return false;
+    }
+
+    const ggml_tensor * weight = nullptr;
+    if (mul->src[0] == rms_norm) {
+        weight = mul->src[1];
+    } else if (mul->src[1] == rms_norm) {
+        weight = mul->src[0];
+    } else {
+        return false;
+    }
+    if (weight == nullptr || weight->type != GGML_TYPE_F32 ||
+        weight->ne[0] != rms_norm->ne[0] || ggml_nelements(weight) != rms_norm->ne[0] ||
+        !ggml_is_contiguous(weight) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    ggml_sycl_op_rms_norm_mul(ctx, rms_norm, weight, mul);
+    skip_to = mul_idx;
+    return true;
+}
+
+static bool ggml_sycl_try_mul_scalar_add(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
+    ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 ||
+        mul->src[0] == nullptr || mul->src[1] == nullptr ||
+        mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((mul->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    const ggml_tensor * mul_src    = nullptr;
+    const ggml_tensor * scalar_src = nullptr;
+    if (ggml_nelements(mul->src[0]) == 1 && ggml_are_same_shape(mul->src[1], mul)) {
+        scalar_src = mul->src[0];
+        mul_src    = mul->src[1];
+    } else if (ggml_nelements(mul->src[1]) == 1 && ggml_are_same_shape(mul->src[0], mul)) {
+        scalar_src = mul->src[1];
+        mul_src    = mul->src[0];
+    } else {
+        return false;
+    }
+    if (!ggml_is_contiguous(mul_src) || !ggml_is_contiguous(scalar_src)) {
+        return false;
+    }
+
+    int add_idx = node_idx + 1;
+    ggml_tensor * add = ggml_sycl_next_compute_node(cgraph, add_idx, add_idx);
+    if (add == nullptr || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul, add) || !ggml_is_contiguous(add)) {
+        return false;
+    }
+
+    const ggml_tensor * add_src = nullptr;
+    if (add->src[0] == mul) {
+        add_src = add->src[1];
+    } else if (add->src[1] == mul) {
+        add_src = add->src[0];
+    } else {
+        return false;
+    }
+    if (add_src == nullptr || add_src->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add_src, add) || !ggml_is_contiguous(add_src)) {
+        return false;
+    }
+
+    ggml_sycl_mul_scalar_add(ctx, mul_src, scalar_src, add_src, add);
+    skip_to = add_idx;
+    return true;
+}
+
+static bool ggml_sycl_try_sigmoid_mul(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
+    ggml_tensor * sigmoid = cgraph->nodes[node_idx];
+    if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+        sigmoid->type != GGML_TYPE_F32 || sigmoid->src[0] == nullptr ||
+        sigmoid->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((sigmoid->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        !ggml_is_contiguous(sigmoid->src[0])) {
+        return false;
+    }
+
+    int mul_idx = node_idx + 1;
+    ggml_tensor * mul = ggml_sycl_next_compute_node(cgraph, mul_idx, mul_idx);
+    if (mul == nullptr || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(sigmoid, mul) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    const ggml_tensor * other = nullptr;
+    if (mul->src[0] == sigmoid) {
+        other = mul->src[1];
+    } else if (mul->src[1] == sigmoid) {
+        other = mul->src[0];
+    } else {
+        return false;
+    }
+    if (other == nullptr || other->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(other, mul) || !ggml_is_contiguous(other)) {
+        return false;
+    }
+
+    ggml_sycl_sigmoid_mul(ctx, sigmoid, other, mul);
+    skip_to = mul_idx;
+    return true;
+}
+
 static bool ggml_sycl_try_moe_weighted_sum(
     ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
     ggml_tensor * weighted = cgraph->nodes[node_idx];
@@ -4919,11 +5051,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         int skip_to = i;
+        if (ggml_sycl_try_rms_norm_mul(*sycl_ctx, cgraph, i, skip_to)) {
+            i = skip_to;
+            continue;
+        }
+        if (ggml_sycl_try_sigmoid_mul(*sycl_ctx, cgraph, i, skip_to)) {
+            i = skip_to;
+            continue;
+        }
         if (ggml_sycl_try_moe_down_weighted_sum(*sycl_ctx, cgraph, i, skip_to)) {
             i = skip_to;
             continue;
         }
         if (ggml_sycl_try_moe_weighted_sum(*sycl_ctx, cgraph, i, skip_to)) {
+            i = skip_to;
+            continue;
+        }
+        if (ggml_sycl_try_mul_scalar_add(*sycl_ctx, cgraph, i, skip_to)) {
             i = skip_to;
             continue;
         }

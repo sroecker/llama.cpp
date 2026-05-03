@@ -294,6 +294,13 @@ static void unary_op_trunc_kernel(const T * x, T * dst, const int k, const sycl:
     }
 }
 
+static void sigmoid_mul_f32_kernel(const float * x, const float * other, float * dst, const int64_t k,
+                                   const sycl::nd_item<1> & item_ct1) {
+    SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+        dst[i] = op_sigmoid(x[i]) * other[i];
+    }
+}
+
 template<typename T>
 static void clamp(const T * x, T * dst, const float min, const float max, const int k,
                       const sycl::nd_item<1> &item_ct1) {
@@ -976,6 +983,35 @@ void ggml_sycl_gelu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 void ggml_sycl_silu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_silu(ctx, dst);
+}
+
+void ggml_sycl_sigmoid_mul(ggml_backend_sycl_context & ctx, const ggml_tensor * sigmoid,
+                           const ggml_tensor * other, ggml_tensor * dst) {
+    GGML_ASSERT(sigmoid->op == GGML_OP_UNARY);
+    GGML_ASSERT(ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID);
+    GGML_ASSERT(sigmoid->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(sigmoid->type == GGML_TYPE_F32);
+    GGML_ASSERT(other->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(sigmoid, other));
+    GGML_ASSERT(ggml_are_same_shape(sigmoid, dst));
+    GGML_ASSERT(ggml_is_contiguous(sigmoid->src[0]));
+    GGML_ASSERT(ggml_is_contiguous(other));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+
+    const int64_t k = ggml_nelements(dst);
+    const size_t block_size = 256;
+    const size_t num_blocks = ((size_t) k + block_size - 1) / block_size;
+    dpct::queue_ptr stream = ctx.stream();
+
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(num_blocks * block_size), sycl::range<1>(block_size)),
+        [=](sycl::nd_item<1> item_ct1) {
+            sigmoid_mul_f32_kernel((const float *) sigmoid->src[0]->data, (const float *) other->data,
+                                   (float *) dst->data, k, item_ct1);
+        });
 }
 
 void ggml_sycl_gelu_quick(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

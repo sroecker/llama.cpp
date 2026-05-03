@@ -547,7 +547,125 @@ Correctness / validation after final VDR settings:
 
 Interpretation: Q3_K and Q6_K VDR tuning clears the remaining Q3/MMVQ and Q6 output-projection candidates from the previous VTune list and gives another measured `tg128` gain over the already optimized branch. The main visible next candidates are now the residual Q3_K fused MoE kernel, flash-attention tile occupancy, and small `op_mul` broadcasts.
 
-### Balanced GGUF two-GPU baseline
+## Two-GPU long-context KV-cache benchmark
+
+Goal: benchmark the same model on both Arc A770 devices with a more realistic longer prompt/generation shape and quantized KV cache.
+
+Device discovery:
+
+| device | name | free memory | reorder |
+| --- | --- | ---: | --- |
+| `SYCL0` | Intel Arc A770 Graphics | `15473 MiB` | yes |
+| `SYCL1` | Intel Arc A770 Graphics | `15473 MiB` | yes |
+
+Benchmark shape:
+
+- Prompt tokens: `4096`
+- Generated tokens: `512`
+- Repetitions: `3`
+- Flash attention: enabled
+- GPU layers: `99`
+- KV cache variants: `q8_0/q8_0` and `q4_0/q4_0`
+- Devices tested: `SYCL0`, `SYCL1`, and `SYCL0/SYCL1` with default layer split
+
+Representative command:
+
+```sh
+./build-f16/bin/llama-bench -r 3 -p 4096 -n 512 \
+  -ctk q8_0 -ctv q8_0 -dev SYCL0 \
+  -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+Results:
+
+| devices | KV cache | `pp4096` t/s | `tg512` t/s |
+| --- | --- | ---: | ---: |
+| `SYCL0` | `q8_0/q8_0` | `325.19 +/- 0.52` | `14.27 +/- 0.12` |
+| `SYCL1` | `q8_0/q8_0` | `319.66 +/- 0.65` | `14.72 +/- 0.05` |
+| `SYCL0` | `q4_0/q4_0` | `324.43 +/- 0.50` | `14.27 +/- 0.12` |
+| `SYCL1` | `q4_0/q4_0` | `319.26 +/- 0.89` | `14.61 +/- 0.05` |
+| `SYCL0/SYCL1` | `q8_0/q8_0` | `514.94 +/- 0.59` | `14.51 +/- 0.01` |
+| `SYCL0/SYCL1` | `q4_0/q4_0` | `514.43 +/- 0.24` | `14.37 +/- 0.02` |
+
+Interpretation:
+
+- The two A770s are close, but not identical: `SYCL0` is slightly faster on prompt processing, while `SYCL1` is faster on generation in this run.
+- Dual-GPU layer split gives a large prompt-processing gain: best dual `pp4096` is `514.94` t/s versus best single-GPU `325.19` t/s, about `+58%`.
+- Dual-GPU layer split does not improve generation for this decode-heavy shape: best single-GPU `tg512` is `14.72` t/s on `SYCL1`, while dual q8 is `14.51` t/s.
+- `q4_0` KV did not improve throughput at this context length. It was flat to slightly slower than `q8_0`, so `q8_0` is the better performance choice here unless memory pressure requires q4.
+
+Going-forward two-GPU optimization baseline:
+
+| benchmark target | baseline |
+| --- | ---: |
+| Prompt throughput, `SYCL0/SYCL1`, `q8_0` KV | `pp4096 514.94 +/- 0.59` t/s |
+| Decode throughput, `SYCL0/SYCL1`, `q8_0` KV | `tg512 14.51 +/- 0.01` t/s |
+| Best single-GPU decode reference, `SYCL1`, `q8_0` KV | `tg512 14.72 +/- 0.05` t/s |
+
+For future two-GPU work, use `SYCL0/SYCL1` with `q8_0` KV as the main benchmark target. A useful decode optimization should beat both the dual-GPU baseline and the single-GPU `SYCL1` reference; otherwise it may only be improving prompt processing or moving overhead between devices.
+
+## Two-GPU decode optimization pass
+
+Goal: improve the two-GPU long-context q8 KV decode baseline by at least 5%.
+
+Baseline:
+
+```sh
+./build-f16/bin/llama-bench -r 3 -p 4096 -n 512 \
+  -ctk q8_0 -ctv q8_0 -dev SYCL0/SYCL1 \
+  -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+| metric | baseline |
+| --- | ---: |
+| `pp4096` | `514.94 +/- 0.59` t/s |
+| `tg512` | `14.51 +/- 0.01` t/s |
+
+Kernel expert guidance received:
+
+- Treat the previous profile as occupancy / tiny-kernel limited, not memory-bandwidth limited.
+- Keep Q3_K VDR at 2 for now; the next gain should come from exposing more independent work or removing small kernels.
+- Try FA vector for single-token decode.
+- Try Q3_K MoE MMVQ row grouping at 4 and 8 rows per work-group.
+- Prefer explicit hot-path `op_mul` fusion before SYCL graph replay.
+
+Experiments:
+
+| experiment | result | decision |
+| --- | --- | --- |
+| Force FA vector for non-quantized `Q->ne[1] == 1` decode | f16 KV `tg512 14.95 +/- 0.02` vs f16 baseline `14.82 +/- 0.03`; q8 path unchanged and measured `14.43 +/- 0.02` | Keep selector simplification. Positive for f16 KV, neutral/noisy for q8 because q8 already used vector for `nq <= 2`. |
+| Q3_K MoE MMVQ `ROWS_PER_WG=4` | q8 two-GPU `tg512 14.45 +/- 0.05` | Reject. Correct but slower than baseline. |
+| Q3_K MoE MMVQ `ROWS_PER_WG=8` | q8 two-GPU `tg512 14.43 +/- 0.03` | Reject. Correct but slower than baseline. |
+| Fuse `RMS_NORM + MUL` for F32 norm-scale patterns | q8 two-GPU `pp4096 520.33 +/- 0.37`, `tg512 15.08 +/- 0.02` | Keep. Removes standalone `attn_norm`, `attn_post_norm`, `Qcur_normed`, `Kcur_normed`, and `result_norm` multiply launches. |
+| Fuse F32 vector-by-scalar multiply plus add for shared expert gate | q8 two-GPU `pp4096 516.25 +/- 0.46`, `tg512 15.22 +/- 0.05` | Keep for decode. Removes standalone `ffn_shexp_gated` multiply and folds the following add. |
+| Fuse F32 `SIGMOID + MUL` for exact same-shape gated attention | q8 two-GPU `pp4096 519.21 +/- 0.56`, `tg512 15.34 +/- 0.00` | Keep. Removes standalone `attn_gated` multiply and reaches the target. |
+
+Notes:
+
+- Although the build directory is `build-f16`, these fused paths are intentionally F32. The debug graph shows the target activation and norm tensors as `type=f32`; the build merely enables F16-capable SYCL support and does not make all runtime tensors F16.
+- The Q3_K row-grouping experiment matched the expert's suggested shape, but it did not improve this two-GPU q8 decode target. It may still be worth revisiting with a single-GPU decode target or a fused expert-dimension launch, but the simple work-group shape change is not enough here.
+
+Final accepted two-GPU result:
+
+| metric | baseline | final | improvement |
+| --- | ---: | ---: | ---: |
+| `pp4096` | `514.94 +/- 0.59` | `519.21 +/- 0.56` | `+0.8%` |
+| `tg512` | `14.51 +/- 0.01` | `15.34 +/- 0.00` | `+5.7%` |
+
+Validation:
+
+| validation | result |
+| --- | --- |
+| `cmake --build build-f16 --target llama-bench test-backend-ops -j6` | passed |
+| `./build-f16/bin/test-backend-ops test -o FLASH_ATTN_EXT -b SYCL0` | `2592/2592 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o RMS_NORM -b SYCL0` | `21/21 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL -b SYCL0` | `91/91 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o SIGMOID -b SYCL0` | `8/8 tests passed` |
+
+## Balanced GGUF two-GPU baseline
 
 Goal: check whether `Qwen3.6-35B-A3B-APEX-Balanced.gguf` is viable now that two GPUs are available.
 
@@ -582,7 +700,7 @@ Interpretation:
 - The file-size-based estimate was too pessimistic for decode. Treat Balanced as a viable two-GPU candidate.
 - The next Balanced tests should focus on runtime flags first, because the existing decode fusions already carry over and the remaining gap may be split / cache / batching related.
 
-### Balanced Q5_K MMVQ VDR tuning
+## Balanced Q5_K MMVQ VDR tuning
 
 Goal: apply the same MMVQ-style VDR tuning used for the lower-quant Mini path to Balanced's `Q5_K - Medium` weights.
 
@@ -618,7 +736,7 @@ Validation for the VDR=4 candidate:
 
 Interpretation: Q5_K behaves differently from the lower-quant Mini path. VDR=4 is useful, but mostly for prompt throughput; decode is only slightly better. VDR=8 appears to create too much per-lane work or register pressure for this shape.
 
-### Local-only flag candidates
+## Local-only flag candidates
 
 These flags are useful for local performance testing and do not imply upstreamable code changes.
 

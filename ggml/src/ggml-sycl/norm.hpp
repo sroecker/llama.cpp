@@ -19,6 +19,9 @@ void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_rms_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
+void ggml_sycl_op_rms_norm_mul(ggml_backend_sycl_context & ctx, const ggml_tensor * rms_norm,
+                               const ggml_tensor * weight, ggml_tensor * dst);
+
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);

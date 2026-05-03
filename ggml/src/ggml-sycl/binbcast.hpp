@@ -30,10 +30,12 @@ void ggml_sycl_sub(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+void ggml_sycl_mul_scalar_add(ggml_backend_sycl_context & ctx, const ggml_tensor * mul_src,
+                              const ggml_tensor * scalar_src, const ggml_tensor * add_src, ggml_tensor * dst);
+
 void ggml_sycl_div(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_repeat(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 
 #endif //GGML_SYCL_BINBCAST_HPP
-
