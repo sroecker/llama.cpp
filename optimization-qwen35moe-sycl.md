@@ -736,6 +736,37 @@ Validation for the VDR=4 candidate:
 
 Interpretation: Q5_K behaves differently from the lower-quant Mini path. VDR=4 is useful, but mostly for prompt throughput; decode is only slightly better. VDR=8 appears to create too much per-lane work or register pressure for this shape.
 
+## Active-expert MoE MMVQ scheduling experiments
+
+Goal: apply the GPU-kernel guidance to expose more independent active-expert decode work per launch without changing the existing graph ops.
+
+Baseline comparison points:
+
+| target | baseline state | `pp4096` | `tg512` |
+| --- | --- | ---: | ---: |
+| Mini two-GPU q8 KV | after decode fusions | `519.21 +/- 0.56` | `15.34 +/- 0.00` |
+| Balanced two-GPU q8 KV | after Q5_K VDR=4 | `497.90 +/- 0.40` | `15.11 +/- 0.03` |
+
+Screened candidates:
+
+| candidate | Mini `pp4096` | Mini `tg512` | Balanced `pp4096` | Balanced `tg512` | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Weighted-sum Q3_K/Q5_K split by active expert with destination zero + global atomic add | `523.93 +/- 1.07` | `15.26 +/- 0.02` | `497.37 +/- 0.53` | `15.00 +/- 0.02` | Reject. Correct, but decode regressed; atomics and the extra zero kernel outweighed added parallelism. |
+| Weighted-sum Q3_K/Q5_K local reduction, one workgroup containing all active-expert subgroups for one row | `522.07 +/- 0.95` | `15.25 +/- 0.01` | `499.13 +/- 0.20` | `15.10 +/- 0.03` | Reject. Removed global atomics but still did not improve decode. |
+| Non-weighted Q5_K MoE MMVQ with `ROWS_PER_WG=4` | not run | not run | `495.84 +/- 1.88` | `15.14 +/- 0.03` | Reject. Tiny decode movement with prompt regression. |
+| Non-weighted Q5_K MoE MMVQ with `ROWS_PER_WG=2` | `510.57 +/- 0.93` | `15.01 +/- 0.06` | `498.14 +/- 0.69` | `15.15 +/- 0.01` | Reject. Balanced decode was slightly higher, but Mini regressed in the final cleaned-state check. |
+
+Validation while screening:
+
+| validation | result |
+| --- | --- |
+| `cmake --build build-f16 --target llama-bench test-backend-ops -j6` | passed for each built candidate |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p 'type_a=q5_K'` | `2/2 tests passed` for Q5_K row grouping |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p 'type_a=q[35]_K'` | `4/4 tests passed` for weighted-sum screens' related non-weighted coverage |
+
+Finding: simply increasing scheduled expert/row granularity is not enough for this workload. The weighted-sum variants create extra synchronization, local-memory, atomic, or zeroing cost, and the Q5_K row-grouping variants are too small to justify keeping when Mini safety is considered. All active-expert scheduling source changes from this section were backed out; keep the previous VDR/fusion commits as the current best local state.
+
 ## Local-only flag candidates
 
 These flags are useful for local performance testing and do not imply upstreamable code changes.
