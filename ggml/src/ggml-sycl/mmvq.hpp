@@ -45,4 +45,25 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             ids_token_stride,     // bytes between tokens in ids
     dpct::queue_ptr    stream);
 
+bool ggml_sycl_mul_mat_vec_q_id_weighted_sum(
+    enum ggml_type     src0_type,
+    const void *       vx_base,
+    const void *       vy,
+    const char *       ids_dev,
+    const char *       weights_dev,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    int                n_tokens,
+    size_t             expert_weight_stride,
+    size_t             dst_token_stride,
+    size_t             src1_row_stride,
+    size_t             src1_token_stride,
+    size_t             ids_row_stride,
+    size_t             ids_token_stride,
+    size_t             weights_row_stride,
+    size_t             weights_token_stride,
+    dpct::queue_ptr    stream);
+
 #endif // GGML_SYCL_MMVQ_HPP

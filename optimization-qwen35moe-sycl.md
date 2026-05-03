@@ -236,9 +236,118 @@ Top GPU tasks by total time:
 
 Interpretation: this workload is dominated by a very high number of very small GPU/API tasks. The best remaining optimization direction is reducing launch/API overhead or fusing adjacent tiny operations, especially around MoE matvec, activation quantization, and elementwise add/mul paths.
 
-## Final outcome
+## Prompt-path outcome before TG follow-up
 
 - The requested `./build-f16/bin/llama-bench ...` benchmark now reaches `164.13 +/- 3.48` t/s on `pp512`, up from the clean baseline `109.40 +/- 1.18` t/s.
 - Final measured `pp512` improvement: about `+50.0%`.
 - `tg128` remains near baseline: final `9.14 +/- 0.03` t/s versus clean baseline `9.20 +/- 0.04` t/s.
 - `MUL_MAT_ID` correctness validation passed on SYCL0: `690/690 tests passed`.
+
+## TG128 follow-up
+
+New target: improve isolated `tg128` by at least 5%.
+
+TG-only baseline command:
+
+```sh
+./build-f16/bin/llama-bench -p 0 -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+TG-only baseline result: `9.37 +/- 0.06` t/s. The +5% target for isolated TG is about `9.84` t/s.
+
+After installing Fedora's Metrics Discovery package, VTune GPU Hotspots works:
+
+```sh
+vtune -collect gpu-hotspots \
+  -result-dir vtune-qwen35moe-tg-gpu-hotspots -- \
+  ./build-f16/bin/llama-bench -r 1 -p 0 -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+Profiled TG row with VTune overhead: `9.02` t/s.
+
+Important VTune GPU Hotspots findings:
+
+| Metric | Value |
+| --- | ---: |
+| GPU time | `15.046s` |
+| GPU time as elapsed | `53.7%` |
+| XVE Array Stalled/Idle | `95.2%` |
+| GPU L3 bandwidth bound | `0.6% of peak` |
+| Occupancy | `14.3% of peak` |
+
+Top low-occupancy GPU tasks:
+
+| GPU task | Total time | Peak XVE threads occupancy | Occupancy |
+| --- | ---: | ---: | ---: |
+| `mul_mat_vec_iq2_s_q8_1_sycl` | `0.525s` | `12.5%` | `36.2%` |
+| `bin_bcast_sycl<op_add>` | `0.483s` | `0.8%` | `24.1%` |
+| `quantize_row_q8_1_sycl` | `0.364s` | `1.6%` | `29.2%` |
+
+Interpretation: TG is not L3 bandwidth bound. It is dominated by many small low-occupancy kernels and host/offload overhead, so the next useful direction is reducing launch count and tiny elementwise/quantization kernels in generation.
+
+### TG experiment: MoE weighted-sum graph fusion
+
+The decode graph materializes each MoE down projection as:
+
+```text
+ffn_moe_down-* = MUL_MAT_ID(... selected experts ...)
+ffn_moe_weighted-* = ffn_moe_down-* * ffn_moe_weights_norm-*
+ffn_moe_out-* = ADD chain over 8 expert views
+```
+
+Initial attempt: add a graph rewrite for the `MUL` plus seven-`ADD` reduction after `ffn_moe_down-*`.
+
+Finding: this was too weak for the target, and the first matcher did not account for no-op `VIEW` nodes in the cgraph. Debugging with `GGML_SYCL_DEBUG=1` showed that the original `ffn_moe_weighted-*` and add chain were still executing.
+
+Accepted implementation:
+
+- Added a graph helper that walks to the next executable node while skipping empty, `RESHAPE`, `TRANSPOSE`, `VIEW`, `PERMUTE`, and `NONE` nodes, matching the existing SYCL executor skip behavior.
+- Added a direct MoE down fast path that recognizes `MUL_MAT_ID -> MUL(weights) -> ADD...` and launches one weighted-sum MMVQ kernel.
+- The new kernel loops over selected experts inside one row/token workgroup, multiplies each expert dot product by `ffn_moe_weights_norm`, and writes the final `ffn_moe_out-*` tensor directly.
+- Added cgraph use-count checks so the rewrite only skips tensors consumed by this exact weighted-sum chain.
+- Kept a post-`MUL` weighted-sum fusion fallback for layers where direct down fusion is not selected.
+
+TG-only result after the active direct fusion:
+
+| command | baseline | result | improvement |
+| --- | ---: | ---: | ---: |
+| `llama-bench -p 0 ...` | `9.37 +/- 0.06` | `10.07 +/- 0.03` | `+7.5%` |
+
+Original combined benchmark after the active direct fusion:
+
+| test | previous optimized result | final result | change |
+| --- | ---: | ---: | ---: |
+| `pp512` | `164.13 +/- 3.48` | `163.18 +/- 4.41` | about unchanged |
+| `tg128` | `9.14 +/- 0.03` | `9.75 +/- 0.03` | `+6.7%` |
+
+Correctness / smoke validation:
+
+| validation | result |
+| --- | --- |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0` | `690/690 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+| `llama-bench -r 1 -p 0 -n 1 --no-warmup ...` | completed |
+| `GGML_SYCL_DEBUG=1 ... \| rg "ffn_moe_down-0\|ffn_moe_weighted-0\|ffn_moe_out-0"` | no compute trace for the skipped chain |
+
+Final VTune GPU Hotspots pass with the active fusion:
+
+| Metric | Value |
+| --- | ---: |
+| Profiled TG row | `9.75` t/s |
+| GPU time | `13.530s` |
+| GPU time as elapsed | `50.4%` |
+| XVE Array Stalled/Idle | `94.9%` |
+| GPU L3 bandwidth bound | `0.6% of peak` |
+| Occupancy | `14.6% of peak` |
+
+Final top low-occupancy GPU tasks:
+
+| GPU task | Total time | Peak XVE threads occupancy | Occupancy |
+| --- | ---: | ---: | ---: |
+| `mul_mat_vec_iq2_s_q8_1_sycl` | `0.510s` | `12.5%` | `3.1%` |
+| `quantize_row_q8_1_sycl` | `0.349s` | `1.6%` | `7.7%` |
+| `dequantize_mul_mat_vec_q3_K_sycl` | `0.321s` | `50.0%` | `27.8%` |
+
+The prior `bin_bcast_sycl<op_add>` hotspot (`0.483s`) is no longer in the final top low-occupancy list, which matches the intended effect of removing the MoE weighted add-reduction chain from decode.

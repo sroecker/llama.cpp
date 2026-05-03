@@ -3869,6 +3869,68 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         stream);
 }
 
+static bool ggml_sycl_mul_mat_id_mmvq_weighted_sum_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+    const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * weights, ggml_tensor * dst)
+{
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    if (src1->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
+    if (!ggml_is_contiguous(src1)) return false;
+
+    const ggml_tensor_extra_gpu * src0_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (src0_extra && src0_extra->optimized_feature.reorder) return false;
+
+    const int64_t n_ids_per_group = ids->ne[0];
+    const int64_t n_tokens        = ids->ne[1];
+    if (ids->ne[2] != 1 || ids->ne[3] != 1) return false;
+    if (n_tokens < 1 || ne12 != n_tokens) return false;
+    if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+
+    const int64_t nrows = src0->ne[1];
+    if (weights->ne[0] != 1 || weights->ne[1] != n_ids_per_group ||
+        weights->ne[2] != n_tokens || weights->ne[3] != 1 ||
+        weights->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (dst->ne[0] != nrows || dst->ne[1] != 1 || dst->ne[2] != n_tokens ||
+        dst->ne[3] != 1 || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+    const int       n_experts_used   = (int) n_ids_per_group;
+    const size_t    bytes_per_qrow   = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
+        (size_t) ne11 * ne12 * bytes_per_qrow);
+    char * src1_ddq = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_q8_1>(
+        (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
+        src1_padded_cols, stream);
+
+    const size_t src1_row_stride   = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+
+    return ggml_sycl_mul_mat_vec_q_id_weighted_sum(
+        src0->type, src0->data, src1_ddq, (const char *) ids->data,
+        (const char *) weights->data, (float *) dst->data, (int) ne10,
+        (int) nrows, n_experts_used, (int) n_tokens,
+        /*expert_weight_stride=*/ src0->nb[2],
+        /*dst_token_stride=*/ dst->nb[2],
+        src1_row_stride, src1_token_stride,
+        /*ids_row_stride=*/ ids->nb[0],
+        /*ids_token_stride=*/ ids->nb[1],
+        /*weights_row_stride=*/ weights->nb[1],
+        /*weights_token_stride=*/ weights->nb[2],
+        stream);
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -4554,6 +4616,294 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+static ggml_tensor * ggml_sycl_next_compute_node(ggml_cgraph * cgraph, int start, int & node_idx) {
+    for (node_idx = start; node_idx < cgraph->n_nodes; ++node_idx) {
+        ggml_tensor * node = cgraph->nodes[node_idx];
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
+static bool ggml_sycl_mark_weighted_moe_view(
+    const ggml_tensor * view, const ggml_tensor * weighted, int64_t nrows, int64_t n_experts,
+    int64_t n_tokens, std::vector<bool> & seen) {
+    if (view == nullptr || view->view_src != weighted) {
+        return false;
+    }
+    if (view->type != GGML_TYPE_F32 || view->ne[0] != nrows || view->ne[1] != 1 ||
+        view->ne[2] != n_tokens || view->ne[3] != 1) {
+        return false;
+    }
+    if (view->view_offs % weighted->nb[1] != 0) {
+        return false;
+    }
+
+    const int64_t expert = view->view_offs / weighted->nb[1];
+    if (expert < 0 || expert >= n_experts) {
+        return false;
+    }
+
+    seen[expert] = true;
+    return true;
+}
+
+static void ggml_sycl_moe_weighted_sum(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * values, const ggml_tensor * weights,
+    ggml_tensor * dst) {
+    const int64_t nrows    = values->ne[0];
+    const int64_t n_expert = values->ne[1];
+    const int64_t n_tokens = values->ne[2];
+
+    const char * values_data  = (const char *) values->data;
+    const char * weights_data = (const char *) weights->data;
+    char *       dst_data     = (char *) dst->data;
+
+    const size_t values_nb0  = values->nb[0];
+    const size_t values_nb1  = values->nb[1];
+    const size_t values_nb2  = values->nb[2];
+    const size_t weights_nb1 = weights->nb[1];
+    const size_t weights_nb2 = weights->nb[2];
+    const size_t dst_nb0     = dst->nb[0];
+    const size_t dst_nb2     = dst->nb[2];
+
+    const size_t total  = nrows * n_tokens;
+    const size_t local  = 256;
+    const size_t global = GGML_PAD((int) total, (int) local);
+    dpct::queue_ptr stream = ctx.stream();
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(local)),
+            [=](sycl::nd_item<1> item) {
+                const size_t idx = item.get_global_id(0);
+                if (idx >= total) {
+                    return;
+                }
+
+                const int64_t row   = idx % nrows;
+                const int64_t token = idx / nrows;
+
+                float sum = 0.0f;
+                for (int64_t expert = 0; expert < n_expert; ++expert) {
+                    const float v = *(const float *) (values_data +
+                        (size_t) row * values_nb0 +
+                        (size_t) expert * values_nb1 +
+                        (size_t) token * values_nb2);
+                    const float w = *(const float *) (weights_data +
+                        (size_t) expert * weights_nb1 +
+                        (size_t) token * weights_nb2);
+                    sum += v * w;
+                }
+
+                *(float *) (dst_data + (size_t) row * dst_nb0 + (size_t) token * dst_nb2) = sum;
+            });
+    });
+}
+
+static bool ggml_sycl_try_moe_weighted_sum(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
+    ggml_tensor * weighted = cgraph->nodes[node_idx];
+    if (weighted->op != GGML_OP_MUL || weighted->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * values  = weighted->src[0];
+    const ggml_tensor * weights = weighted->src[1];
+    if (values == nullptr || weights == nullptr ||
+        values->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t nrows    = values->ne[0];
+    const int64_t n_expert = values->ne[1];
+    const int64_t n_tokens = values->ne[2];
+    if (nrows < 1 || n_expert < 2 || n_tokens < 1 ||
+        values->ne[3] != 1 || weighted->ne[0] != nrows ||
+        weighted->ne[1] != n_expert || weighted->ne[2] != n_tokens ||
+        weighted->ne[3] != 1) {
+        return false;
+    }
+    if (weights->ne[0] != 1 || weights->ne[1] != n_expert ||
+        weights->ne[2] != n_tokens || weights->ne[3] != 1) {
+        return false;
+    }
+    if (values->nb[0] != sizeof(float) || weights->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if ((weighted->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        ggml_node_get_use_count(cgraph, node_idx) != n_expert) {
+        return false;
+    }
+
+    std::vector<bool> seen(n_expert, false);
+    ggml_tensor * prev = nullptr;
+    int add_idx = node_idx + 1;
+    int last_add_idx = node_idx;
+
+    for (int64_t i = 0; i < n_expert - 1; ++i) {
+        ggml_tensor * add = ggml_sycl_next_compute_node(cgraph, add_idx, add_idx);
+        if (add == nullptr) {
+            return false;
+        }
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            add->ne[0] != nrows || add->ne[1] != 1 ||
+            add->ne[2] != n_tokens || add->ne[3] != 1 ||
+            add->nb[0] != sizeof(float)) {
+            return false;
+        }
+
+        if (i == 0) {
+            if (!ggml_sycl_mark_weighted_moe_view(add->src[0], weighted, nrows, n_expert, n_tokens, seen) ||
+                !ggml_sycl_mark_weighted_moe_view(add->src[1], weighted, nrows, n_expert, n_tokens, seen)) {
+                return false;
+            }
+        } else {
+            const ggml_tensor * view = nullptr;
+            if (add->src[0] == prev) {
+                view = add->src[1];
+            } else if (add->src[1] == prev) {
+                view = add->src[0];
+            } else {
+                return false;
+            }
+            if (!ggml_sycl_mark_weighted_moe_view(view, weighted, nrows, n_expert, n_tokens, seen)) {
+                return false;
+            }
+        }
+
+        if (i < n_expert - 2 && !ggml_node_has_n_uses(cgraph, add_idx, 1)) {
+            return false;
+        }
+
+        prev = add;
+        last_add_idx = add_idx;
+        add_idx++;
+    }
+
+    for (bool expert_seen : seen) {
+        if (!expert_seen) {
+            return false;
+        }
+    }
+
+    ggml_sycl_moe_weighted_sum(ctx, values, weights, prev);
+    skip_to = last_add_idx;
+    return true;
+}
+
+static bool ggml_sycl_try_moe_down_weighted_sum(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx, int & skip_to) {
+    ggml_tensor * values = cgraph->nodes[node_idx];
+    if (values->op != GGML_OP_MUL_MAT_ID || values->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    int weighted_idx = node_idx + 1;
+    ggml_tensor * weighted = ggml_sycl_next_compute_node(cgraph, weighted_idx, weighted_idx);
+    if (weighted == nullptr) {
+        return false;
+    }
+    if (weighted->op != GGML_OP_MUL || weighted->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * weights = nullptr;
+    if (weighted->src[0] == values) {
+        weights = weighted->src[1];
+    } else if (weighted->src[1] == values) {
+        weights = weighted->src[0];
+    } else {
+        return false;
+    }
+    if (weights == nullptr || weights->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t nrows    = values->ne[0];
+    const int64_t n_expert = values->ne[1];
+    const int64_t n_tokens = values->ne[2];
+    if (nrows < 1 || n_expert < 2 || n_tokens < 1 ||
+        values->ne[3] != 1 || weighted->ne[0] != nrows ||
+        weighted->ne[1] != n_expert || weighted->ne[2] != n_tokens ||
+        weighted->ne[3] != 1 || values->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (weights->ne[0] != 1 || weights->ne[1] != n_expert ||
+        weights->ne[2] != n_tokens || weights->ne[3] != 1 ||
+        weights->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (!ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        (weighted->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        ggml_node_get_use_count(cgraph, weighted_idx) != n_expert) {
+        return false;
+    }
+
+    std::vector<bool> seen(n_expert, false);
+    ggml_tensor * prev = nullptr;
+    int add_idx = weighted_idx + 1;
+    int last_add_idx = weighted_idx;
+
+    for (int64_t i = 0; i < n_expert - 1; ++i) {
+        ggml_tensor * add = ggml_sycl_next_compute_node(cgraph, add_idx, add_idx);
+        if (add == nullptr) {
+            return false;
+        }
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            add->ne[0] != nrows || add->ne[1] != 1 ||
+            add->ne[2] != n_tokens || add->ne[3] != 1 ||
+            add->nb[0] != sizeof(float)) {
+            return false;
+        }
+
+        if (i == 0) {
+            if (!ggml_sycl_mark_weighted_moe_view(add->src[0], weighted, nrows, n_expert, n_tokens, seen) ||
+                !ggml_sycl_mark_weighted_moe_view(add->src[1], weighted, nrows, n_expert, n_tokens, seen)) {
+                return false;
+            }
+        } else {
+            const ggml_tensor * view = nullptr;
+            if (add->src[0] == prev) {
+                view = add->src[1];
+            } else if (add->src[1] == prev) {
+                view = add->src[0];
+            } else {
+                return false;
+            }
+            if (!ggml_sycl_mark_weighted_moe_view(view, weighted, nrows, n_expert, n_tokens, seen)) {
+                return false;
+            }
+        }
+
+        if (i < n_expert - 2 && !ggml_node_has_n_uses(cgraph, add_idx, 1)) {
+            return false;
+        }
+
+        prev = add;
+        last_add_idx = add_idx;
+        add_idx++;
+    }
+
+    for (bool expert_seen : seen) {
+        if (!expert_seen) {
+            return false;
+        }
+    }
+
+    if (!ggml_sycl_mul_mat_id_mmvq_weighted_sum_fused(
+            ctx, values->src[0], values->src[1], values->src[2], weights, prev)) {
+        return false;
+    }
+
+    skip_to = last_add_idx;
+    return true;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
@@ -4563,6 +4913,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        int skip_to = i;
+        if (ggml_sycl_try_moe_down_weighted_sum(*sycl_ctx, cgraph, i, skip_to)) {
+            i = skip_to;
+            continue;
+        }
+        if (ggml_sycl_try_moe_weighted_sum(*sycl_ctx, cgraph, i, skip_to)) {
+            i = skip_to;
             continue;
         }
 #ifndef NDEBUG
