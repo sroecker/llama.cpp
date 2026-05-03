@@ -84,7 +84,7 @@ template <> struct block_q_t<GGML_TYPE_Q6_K> {
         static constexpr uint32_t qk       = QK_K;
         static constexpr uint32_t qi       = QI6_K;
         static constexpr uint32_t qr       = QR6_K;
-        static constexpr uint32_t vdr_mmvq = 1;
+        static constexpr uint32_t vdr_mmvq = 4;
     };
 
     static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {

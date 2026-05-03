@@ -158,7 +158,7 @@ static __dpct_inline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 }
 
 
-#define VDR_Q3_K_Q8_1_MMVQ 1
+#define VDR_Q3_K_Q8_1_MMVQ 2
 
 // contiguous v/x values
 static __dpct_inline__ float vec_dot_q3_K_q8_1_impl_mmvq(
@@ -271,7 +271,7 @@ static __dpct_inline__ float vec_dot_q5_K_q8_1_impl_vmmq(
 }
 
 
-#define VDR_Q6_K_Q8_1_MMVQ 1
+#define VDR_Q6_K_Q8_1_MMVQ 4
 
 // contiguous v/x values
 static __dpct_inline__ float
@@ -509,7 +509,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
         return d * sumf;
     }
 
-    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+    __dpct_inline__ float vec_dot_q6_K_q8_1_one(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
                      const int iqs) {
         const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
@@ -537,6 +537,17 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
             d8[i]                       = ds_values[0];
         }
         return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scs, *d, d8);
+    }
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                     const int iqs) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < (int) q6_k_traits::vdr_mmvq; ++i) {
+            sum += vec_dot_q6_K_q8_1_one(vbq, ibx_offset, d_offset, q8_1_quant_ptr, q8_1_ds, iqs + i);
+        }
+        return sum;
     }
 };
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -924,8 +935,8 @@ vec_dot_q2_K_q8_1(const void *__restrict__ vbq,
 }
 
 static __dpct_inline__ float
-vec_dot_q3_K_q8_1(const void *__restrict__ vbq,
-                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+vec_dot_q3_K_q8_1_one(const void *__restrict__ vbq,
+                      const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
 
     const block_q3_K * bq3_K = (const block_q3_K *) vbq;
 
@@ -949,6 +960,17 @@ vec_dot_q3_K_q8_1(const void *__restrict__ vbq,
     }
 
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+static __dpct_inline__ float
+vec_dot_q3_K_q8_1(const void *__restrict__ vbq,
+                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_Q3_K_Q8_1_MMVQ; ++i) {
+        sum += vec_dot_q3_K_q8_1_one(vbq, bq8_1, iqs + i);
+    }
+    return sum;
 }
 
 static __dpct_inline__ float vec_dot_q4_K_q8_1(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
@@ -1101,8 +1123,8 @@ vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
 }
 
 static __dpct_inline__ float
-vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
-                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+vec_dot_q6_K_q8_1_one(const void *__restrict__ vbq,
+                      const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq;
 
@@ -1125,6 +1147,17 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+
+static __dpct_inline__ float
+vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
+                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_Q6_K_Q8_1_MMVQ; ++i) {
+        sum += vec_dot_q6_K_q8_1_one(vbq, bq8_1, iqs + i);
+    }
+    return sum;
 }
 
 

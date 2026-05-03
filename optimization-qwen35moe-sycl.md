@@ -448,3 +448,101 @@ Correctness / validation:
 | `./build-f16/bin/test-backend-ops test -o MUL_MAT -b SYCL0` | `911/911 tests passed` |
 
 The original `mul_mat_vec_iq2_s_q8_1_sycl` and `quantize_row_q8_1_sycl` candidates are no longer top named VTune tasks after adding IQ2_S to the fused MoE path. The Q3_K DMMV candidate was addressed by dispatching Q3_K decode through MMVQ; the remaining visible hot paths are Q3_K MMVQ/MoE and Q6 output projection work.
+
+### TG follow-up: Q3_K and Q6_K VDR tuning
+
+Fresh VTune/API check before this pass:
+
+```sh
+vtune -collect gpu-offload \
+  -knob collect-programming-api=true \
+  -knob enable-characterization-insights=false \
+  -knob enable-stack-collection=false \
+  -knob dump-compute-task-binaries=false \
+  -result-dir vtune-qwen35moe-gpu-offload-current -- \
+  ./build-f16/bin/llama-bench -r 1 -p 0 -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+Profiled TG row with VTune overhead: `14.19` t/s.
+
+Top findings from that trace:
+
+| area | finding |
+| --- | --- |
+| Host/API overhead | `zeCommandListAppendLaunchKernel`: `6.176s`, `293,756` calls |
+| Host sync | `zeEventHostSynchronize`: `1.980s`, `2,088` calls |
+| Q3_K MoE | `launch_mul_mat_vec_q_moe<..., block_q3_K, ...>`: `0.318s`, `5,160` instances |
+| Q3_K MMVQ | `mul_mat_vec_q3_K_q8_1_sycl`: `0.220s` and `0.198s` groups |
+| Q6_K output | `reorder_mul_mat_vec_q6_k_q8_1_sycl`: `0.219s`, `129` instances |
+
+Screened experiments:
+
+| experiment | result | decision |
+| --- | ---: | --- |
+| Allow compatible `MUL_MAT_ID` graph capture and run with `GGML_SYCL_DISABLE_GRAPH=0` | `14.47` t/s standalone, `14.30` t/s under VTune; launch count still `293,756` | Reject. No host launch-count reduction for this graph. |
+| Q3_K MMVQ/MoE VDR=2 | `15.12 +/- 0.06` first sample; `14.97 +/- 0.01` final Q3-only sample | Keep. VTune Q3 MoE time dropped from `0.318s` to `0.209s`. |
+| Q3_K MMVQ/MoE VDR=4 | `14.99 +/- 0.02` | Reject. Did not beat Q3_K VDR=2. |
+| Disable Q6_K reordered MMVQ | `14.86 +/- 0.10` | Reject. Slower than kept path. |
+| Force Q6_K vector matmul to DMMV | `14.78 +/- 0.02` | Reject. Slower than kept path. |
+| Q6_K MMVQ VDR=2 | `15.08 +/- 0.01` | Keep until VDR=4 screening. |
+| Q6_K MMVQ VDR=4, non-reordered macro only | `15.19 +/- 0.01` | Superseded by full Q6_K VDR=4. |
+| Q4_K reordered VDR=4 accidental screen | `909/911` `MUL_MAT` tests passed | Reject. It fails Q4_K correctness and is not part of the final patch. |
+| Q6_K MMVQ VDR=4, reordered trait plus non-reordered macro | `15.22 +/- 0.05` | Keep. Best screened TG result and correctness passes. |
+
+Final accepted changes in this pass:
+
+- Q3_K MMVQ/MoE now evaluates two dot-product rows per lane through `VDR_Q3_K_Q8_1_MMVQ = 2`.
+- Q6_K MMVQ/MoE now evaluates four rows per lane through `VDR_Q6_K_Q8_1_MMVQ = 4`.
+- Q6_K reordered MMVQ now uses `block_q_t<GGML_TYPE_Q6_K>::traits::vdr_mmvq = 4`.
+- The attempted graph-capture and Q4_K/Q6 fallback dispatch changes were reverted.
+
+Final clean isolated TG sample:
+
+| command | fresh profiled baseline | final result | improvement |
+| --- | ---: | ---: | ---: |
+| `llama-bench -p 0 ...` | `14.19` t/s under VTune | `15.22 +/- 0.05` | `+7.3%` versus profiled baseline |
+
+Original combined benchmark after this pass:
+
+| test | previous remaining-candidates result | final result | change |
+| --- | ---: | ---: | ---: |
+| `pp512` | `340.12 +/- 4.47` | `398.54 +/- 6.44` | `+17.2%` |
+| `tg128` | `14.20 +/- 0.04` | `15.17 +/- 0.04` | `+6.8%` |
+
+Final VTune GPU Hotspots pass:
+
+```sh
+vtune -collect gpu-hotspots \
+  -result-dir vtune-qwen35moe-tg-gpu-hotspots-vdr-final -- \
+  ./build-f16/bin/llama-bench -r 1 -p 0 -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+| Metric | Value |
+| --- | ---: |
+| Profiled TG row | `15.01` t/s |
+| GPU time | `8.877s` |
+| GPU time as elapsed | `41.5%` |
+| XVE Array Stalled/Idle | `92.7%` |
+| GPU L3 bandwidth bound | `0.6% of peak` |
+| Occupancy | `15.7% of peak` |
+
+Top low-occupancy GPU tasks after VDR tuning:
+
+| GPU task | Total time | Peak XVE threads occupancy | Occupancy |
+| --- | ---: | ---: | ---: |
+| `launch_mul_mat_vec_q_moe<..., block_q3_K, VDR=2, ...>` | `0.210s` | `100.0%` | `12.9%` |
+| `flash_attn_tile<...>` | `0.191s` | `1.6%` | `8.5%` |
+| `bin_bcast_sycl<op_mul>` | `0.169s` | `0.8%` | `28.0%` |
+
+Correctness / validation after final VDR settings:
+
+| validation | result |
+| --- | --- |
+| `cmake --build build-f16 --target llama-bench test-backend-ops -j6` | passed |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT -b SYCL0` | `911/911 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0` | `690/690 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+
+Interpretation: Q3_K and Q6_K VDR tuning clears the remaining Q3/MMVQ and Q6 output-projection candidates from the previous VTune list and gives another measured `tg128` gain over the already optimized branch. The main visible next candidates are now the residual Q3_K fused MoE kernel, flash-attention tile occupancy, and small `op_mul` broadcasts.
