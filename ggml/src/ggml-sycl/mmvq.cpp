@@ -1448,6 +1448,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 n_tokens, expert_weight_stride, dst_row_stride, dst_token_stride, src1_row_stride,
                 src1_token_stride, ids_row_stride, ids_token_stride, stream);
             return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe<QK_K, QI2_S/2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                n_tokens, expert_weight_stride, dst_row_stride, dst_token_stride, src1_row_stride,
+                src1_token_stride, ids_row_stride, ids_token_stride, stream);
+            return true;
         case GGML_TYPE_MXFP4:
             launch_mul_mat_vec_q_moe<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
@@ -1551,6 +1557,13 @@ bool ggml_sycl_mul_mat_vec_q_id_weighted_sum(
             return true;
         case GGML_TYPE_Q6_K:
             launch_mul_mat_vec_q_moe_weighted_sum<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                vx_base, vy, ids_dev, weights_dev, dst_base, ncols, nrows, n_experts_used,
+                n_tokens, expert_weight_stride, dst_token_stride, src1_row_stride,
+                src1_token_stride, ids_row_stride, ids_token_stride, weights_row_stride,
+                weights_token_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe_weighted_sum<QK_K, QI2_S/2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
                 vx_base, vy, ids_dev, weights_dev, dst_base, ncols, nrows, n_experts_used,
                 n_tokens, expert_weight_stride, dst_token_stride, src1_row_stride,
                 src1_token_stride, ids_row_stride, ids_token_stride, weights_row_stride,

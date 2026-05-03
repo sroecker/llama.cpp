@@ -3715,6 +3715,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
             use_dequantize_mul_mat_vec && !use_mul_mat_vec_q;
       }
     }
+    if (!g_ggml_sycl_prioritize_dmmv && src0->type == GGML_TYPE_Q3_K && use_mul_mat_vec_q) {
+        use_dequantize_mul_mat_vec = false;
+    }
 
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.

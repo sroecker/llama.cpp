@@ -351,3 +351,100 @@ Final top low-occupancy GPU tasks:
 | `dequantize_mul_mat_vec_q3_K_sycl` | `0.321s` | `50.0%` | `27.8%` |
 
 The prior `bin_bcast_sycl<op_add>` hotspot (`0.483s`) is no longer in the final top low-occupancy list, which matches the intended effect of removing the MoE weighted add-reduction chain from decode.
+
+### TG follow-up: remaining VTune candidates
+
+After the weighted-sum fusion, the remaining VTune candidates were:
+
+- `mul_mat_vec_iq2_s_q8_1_sycl`
+- `quantize_row_q8_1_sycl`
+- `dequantize_mul_mat_vec_q3_K_sycl`
+
+Clean starting point for this pass:
+
+```sh
+./build-f16/bin/llama-bench -p 0 -hf mudler/Qwen3.6-35B-A3B-APEX-GGUF \
+  -hff Qwen3.6-35B-A3B-APEX-I-Mini.gguf -fa 1 -ngl 99
+```
+
+Result: `10.01 +/- 0.03` t/s.
+
+Debug trace finding:
+
+- The `iq2_s` MoE layers were still falling back from `MUL_MAT_ID` into per-expert `ggml_sycl_mul_mat` calls.
+- One-token debug trace count for normal `ggml_sycl_mul_mat` calls with `type=iq2_s`: `480` before, `0` after adding IQ2_S to fused MoE ID dispatch.
+- Q8_1 quantization trace entries in the same one-token run dropped from `1282` to `322` after the IQ2_S fused path was enabled.
+
+Accepted changes:
+
+- Added `GGML_TYPE_IQ2_S` to `ggml_sycl_mul_mat_vec_q_id`.
+- Added `GGML_TYPE_IQ2_S` to `ggml_sycl_mul_mat_vec_q_id_weighted_sum`.
+- Prefer MMVQ over DMMV for Q3_K single-vector decode when `MUL_MAT_VEC_Q` is available and `GGML_SYCL_PRIORITIZE_DMMV` is not set.
+
+Screened experiments:
+
+| experiment | result | decision |
+| --- | ---: | --- |
+| Add IQ2_S to fused MoE ID and weighted-sum dispatch | `14.27 +/- 0.06` t/s | Keep. Removes the top IQ2_S per-expert fallback. |
+| Prefer Q3_K MMVQ over DMMV for decode | `14.43 +/- 0.01` t/s | Keep. Small but repeatable positive sample and removes `dequantize_mul_mat_vec_q3_K_sycl` from the top VTune list. |
+| Use two rows per fused MoE workgroup | `14.34 +/- 0.07` t/s | Do not keep. It did not beat the best kept Q3_K sample. |
+
+Final clean isolated TG sample after keeping IQ2_S fusion and Q3_K MMVQ dispatch:
+
+| command | previous committed result | final result | improvement |
+| --- | ---: | ---: | ---: |
+| `llama-bench -p 0 ...` | `10.01 +/- 0.03` | `14.47 +/- 0.02` | `+44.6%` |
+
+Original combined benchmark after the remaining-candidates pass:
+
+| test | previous weighted-sum result | final result | change |
+| --- | ---: | ---: | ---: |
+| `pp512` | `163.18 +/- 4.41` | `340.12 +/- 4.47` | `+108.4%` |
+| `tg128` | `9.75 +/- 0.03` | `14.20 +/- 0.04` | `+45.6%` |
+
+VTune GPU Hotspots after IQ2_S fusion:
+
+| Metric | Value |
+| --- | ---: |
+| Profiled TG row | `14.22` t/s |
+| GPU time | `9.814s` |
+| XVE Array Stalled/Idle | `92.6%` |
+| GPU L3 bandwidth bound | `0.9% of peak` |
+| Occupancy | `21.1% of peak` |
+
+Top low-occupancy GPU tasks after IQ2_S fusion:
+
+| GPU task | Total time | Peak XVE threads occupancy | Occupancy |
+| --- | ---: | ---: | ---: |
+| `dequantize_mul_mat_vec_q3_K_sycl` | `0.327s` | `50.0%` | `22.8%` |
+| `launch_mul_mat_vec_q_moe<..., block_q3_K, ...>` | `0.317s` | `100.0%` | `19.4%` |
+| `dequantize_mul_mat_vec_q3_K_sycl` | `0.305s` | `100.0%` | `17.6%` |
+
+VTune GPU Hotspots after Q3_K MMVQ dispatch:
+
+| Metric | Value |
+| --- | ---: |
+| Profiled TG row | `14.21` t/s |
+| GPU time | `9.742s` |
+| XVE Array Stalled/Idle | `92.1%` |
+| GPU L3 bandwidth bound | `0.6% of peak` |
+| Occupancy | `18.9% of peak` |
+
+Top low-occupancy GPU tasks after Q3_K MMVQ dispatch:
+
+| GPU task | Total time | Peak XVE threads occupancy | Occupancy |
+| --- | ---: | ---: | ---: |
+| `launch_mul_mat_vec_q_moe<..., block_q3_K, ...>` | `0.316s` | `100.0%` | `17.5%` |
+| `mul_mat_vec_q3_K_q8_1_sycl` | `0.219s` | `50.0%` | `18.9%` |
+| `reorder_mul_mat_vec_q6_k_q8_1_sycl` | `0.219s` | `100.0%` | `73.8%` |
+
+Correctness / validation:
+
+| validation | result |
+| --- | --- |
+| `cmake --build build-f16 --target llama-bench test-backend-ops -j6` | passed |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0` | `690/690 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT_ID_FUSION -b SYCL0` | `13/13 tests passed` |
+| `./build-f16/bin/test-backend-ops test -o MUL_MAT -b SYCL0` | `911/911 tests passed` |
+
+The original `mul_mat_vec_iq2_s_q8_1_sycl` and `quantize_row_q8_1_sycl` candidates are no longer top named VTune tasks after adding IQ2_S to the fused MoE path. The Q3_K DMMV candidate was addressed by dispatching Q3_K decode through MMVQ; the remaining visible hot paths are Q3_K MMVQ/MoE and Q6 output projection work.
