@@ -3824,7 +3824,6 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    if (ne12 != 1) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
@@ -3835,30 +3834,39 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     if (src0_extra && src0_extra->optimized_feature.reorder) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
-    if (ids->ne[1] != 1) return false;
+    const int64_t n_tokens        = ids->ne[1];
+    if (ids->ne[2] != 1 || ids->ne[3] != 1) return false;
+    if (n_tokens < 1 || ne12 != n_tokens) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+    if (dst->ne[1] != n_ids_per_group || dst->ne[2] != n_tokens ||
+        dst->nb[0] != sizeof(float)) return false;
 
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
     const int       n_experts_used   = (int) n_ids_per_group;
     const int       nrows            = (int) src0->ne[1];
+    const size_t    bytes_per_qrow   = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * bytes_per_qrow);
     char * src1_ddq = src1_q8_alloc.get();
     quantize_row_q8_1_sycl<quantize_q8_1>(
-        (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+        (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
         src1_padded_cols, stream);
 
-    const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
-    const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_row_stride   = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
 
     return ggml_sycl_mul_mat_vec_q_id(
-        src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-        (float *) dst->data, (int) ne10, nrows, n_experts_used,
+        src0->type, src0->data, src1_ddq, (const char *) ids->data,
+        (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) n_tokens,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        /*dst_token_stride=*/ dst->nb[2],
+        src1_row_stride, src1_token_stride,
+        /*ids_row_stride=*/ ids->nb[0],
+        /*ids_token_stride=*/ ids->nb[1],
+        stream);
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
@@ -3876,11 +3884,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
-        }
+#ifndef GGML_SYCL_DISABLE_MOE_MMVQ_FUSED
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        return;
     }
+#endif
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char * ids_dev = (const char *) ids->data;
