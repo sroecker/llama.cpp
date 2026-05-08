@@ -2,7 +2,7 @@
 
 Date: 2026-05-08
 
-Branch: `feature/native-nvfp4-5070ti-local`
+Branch: `feature/native-nvfp4-scale-semantics-local`
 
 Target GPU: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, 16 GB class VRAM.
 
@@ -18,8 +18,10 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
+- Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
 - `.input_scale` tensors are loaded and threaded through the graph helpers, but are intentionally not applied as output multipliers. Applying them directly corrupted the Qwen3.6 NVFP4 prompt sanity check while the activation quantizer is still dynamic.
 - `GGML_CUDA_NVFP4_DEBUG=1` now emits a model-load readiness summary for NVFP4 tensors, including `.scale`, `.input_scale`, and K multiple-of-64 coverage.
+- `GGML_CUDA_NVFP4_DEBUG=1` also logs when dense or MoE `.scale` fusion is selected for the native MMQ epilogue.
 - `GGML_CUDA_NVFP4_NATIVE=1` forces the native SM120 path to fail if unavailable. `GGML_CUDA_NVFP4_DEBUG=1` logs the native path. `GGML_CUDA_NVFP4_NATIVE=0` fails closed on this build because there is no safe non-native NVFP4 MMQ fallback specialization in the Blackwell-compiled CUDA path.
 
 ## Local Validation
@@ -27,7 +29,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 Build:
 
 ```sh
-cmake --build build-cuda --target test-backend-ops llama-bench llama-cli -j 8
+cmake --build build-cuda --target test-backend-ops llama-bench llama-cli llama-completion -j 8
 ```
 
 CUDA backend correctness:
@@ -38,6 +40,8 @@ CUDA backend correctness:
 ./build-cuda/bin/test-llama-graph
 ./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CUDA0
 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CUDA0
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
 ```
 
 Results:
@@ -47,6 +51,7 @@ Results:
 - `test-llama-graph`: passed. This structurally verifies that `input_scale` is not used as a post-matmul multiplier in `build_lora_mm` or `build_lora_mm_id`.
 - `MUL_MAT_SCALE`: 2/2 passed.
 - `MUL_MAT_ID_SCALE`: 2/2 passed.
+- Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
 
 Debug readiness smoke test:
 
@@ -82,6 +87,7 @@ Benchmark command:
 | SM120 default cap 64 + quant radius 0 | `6165.73 +/- 4.41 t/s` | `127.12 +/- 0.70 t/s` |
 | Scale-order graph pass | `6171.70 +/- 8.81 t/s` | `127.10 +/- 0.62 t/s` |
 | Readiness/input-scale guard pass | `6167.98 +/- 9.29 t/s` | `127.14 +/- 0.69 t/s` |
+| Batch-gated `.scale` MMQ epilogue fusion | `6294.69 +/- 3.68 t/s` | `127.01 +/- 0.75 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -111,8 +117,9 @@ Default SM120 sanity check:
 ```sh
 ./build-cuda/bin/llama-cli \
     -hf sroecker/Qwen3.6-35B-REAP-Pruned-ratio-0.5-NVFP4-GGUF \
-    -ngl 999 -fa 1 -st --reasoning off --no-display-prompt --temp 0 --seed 1 \
-    -p 'Paris is the capital of' -n 16
+    -ngl 999 -fa 1 -st --simple-io --no-display-prompt \
+    --reasoning off --temp 0 --seed 1 \
+    -p 'Paris is the capital of' -n 32
 ```
 
 Observed completion:
@@ -170,5 +177,6 @@ Final `nsys` with the no-env SM120 defaults:
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
 - `llama-completion -no-cnv` also completed the raw prompt with `France`.
+- The first `.scale` epilogue fusion draft applied to decode-sized workloads too and dropped `tg128` to about `107 t/s`; the current version mirrors normal dispatch and only fuses cases that should use MMQ rather than MMVQ.
 - The first priority for the 5070 Ti is keeping the native path within the 16 GB memory envelope while preserving correctness.
 - Profiling artifacts are local under `profiles/native-nvfp4/` and are not intended for upstream submission.

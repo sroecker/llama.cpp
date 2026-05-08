@@ -2395,6 +2395,11 @@ static bool ggml_cuda_nvfp4_mmq_glu_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_nvfp4_debug_enabled() {
+    const char * env = getenv("GGML_CUDA_NVFP4_DEBUG");
+    return env && std::atoi(env) != 0;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_q_glu(const ggml_tensor * tensor, const ggml_cuda_mm_fusion_args_host & fusion) {
     if (!ggml_cuda_nvfp4_mmq_glu_enabled()) {
         return false;
@@ -3734,6 +3739,38 @@ struct ggml_cuda_scaled_mul_mat_id {
     ggml_tensor * scale = nullptr;
 };
 
+struct ggml_cuda_scaled_mul_mat {
+    ggml_tensor * mm = nullptr;
+    ggml_tensor * scale = nullptr;
+};
+
+static bool ggml_cuda_extract_scaled_mul_mat(ggml_tensor * mul, ggml_cuda_scaled_mul_mat & result) {
+    if (mul->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    ggml_tensor * mm    = nullptr;
+    ggml_tensor * scale = nullptr;
+
+    if (mul->src[0] && mul->src[0]->op == GGML_OP_MUL_MAT && mul->src[1] && mul->src[1]->type == GGML_TYPE_F32) {
+        mm    = mul->src[0];
+        scale = mul->src[1];
+    } else if (mul->src[1] && mul->src[1]->op == GGML_OP_MUL_MAT && mul->src[0] && mul->src[0]->type == GGML_TYPE_F32) {
+        mm    = mul->src[1];
+        scale = mul->src[0];
+    } else {
+        return false;
+    }
+
+    if (!mm->src[0] || !mm->src[1] || ggml_nelements(scale) != 1) {
+        return false;
+    }
+
+    result.mm    = mm;
+    result.scale = scale;
+    return true;
+}
+
 static bool ggml_cuda_extract_scaled_mul_mat_id(ggml_tensor * mul, ggml_cuda_scaled_mul_mat_id & result) {
     if (mul->op != GGML_OP_MUL) {
         return false;
@@ -3769,6 +3806,92 @@ static bool ggml_cuda_extract_scaled_mul_mat_id(ggml_tensor * mul, ggml_cuda_sca
     result.mm    = mm;
     result.scale = scale;
     return true;
+}
+
+static bool ggml_cuda_should_fuse_scaled_mul_mat_q(
+        const ggml_tensor * mm, const ggml_tensor * scale, const ggml_tensor * dst) {
+    if (!mm || !scale || !dst || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+
+    if (!src0 || !src1 || src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(mm, dst)) {
+        return false;
+    }
+
+    const char * native_env = getenv("GGML_CUDA_NVFP4_NATIVE");
+    if (native_env != nullptr && std::strcmp(native_env, "0") == 0) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!blackwell_mma_available(cc)) {
+        return false;
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(src1->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(scale->buffer->buft);
+    if (split) {
+        return false;
+    }
+
+    if (mm->op == GGML_OP_MUL_MAT_ID) {
+        if (!mm->src[2] || mm->src[2]->type != GGML_TYPE_I32 || scale->ne[0] != src0->ne[2]) {
+            return false;
+        }
+
+        if (src1->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            return false;
+        }
+
+        return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/ src0->ne[2]);
+    }
+
+    if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    return ggml_nelements(scale) == 1 &&
+           ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/ 0);
+}
+
+static bool ggml_cuda_can_fuse_scaled_mul_mat(const ggml_cgraph * cgraph, const int i) {
+    const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL };
+    if (!ggml_can_fuse(cgraph, i, ops, 2)) {
+        return false;
+    }
+
+    int out_nodes[] = { i + 1 };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1);
+}
+
+static bool ggml_cuda_can_fuse_scaled_mul_mat_id(const ggml_cgraph * cgraph, const int i) {
+    const ggml_op ops[] = {
+        GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
+    };
+    if (i + 5 > cgraph->n_nodes) {
+        return false;
+    }
+
+    bool ops_match = true;
+    bool uses_ok   = true;
+    for (int j = 0; j < 5; ++j) {
+        const ggml_tensor * node = cgraph->nodes[i + j];
+        if (node->op != ops[j]) {
+            ops_match = false;
+            break;
+        }
+        if (j < 4) {
+            uses_ok = uses_ok && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + j) == 1;
+        }
+    }
+
+    int out_nodes[] = { i + 4 };
+    return ops_match && uses_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1);
 }
 
 static bool ggml_cuda_can_fuse_scaled_mul_mat_id_glu(const ggml_cgraph * cgraph, const int i) {
@@ -4089,6 +4212,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_can_fuse_scaled_mul_mat(cgraph, i)) {
+        ggml_cuda_scaled_mul_mat info;
+        ggml_tensor * scaled = cgraph->nodes[i + 1];
+        if (ggml_cuda_extract_scaled_mul_mat(scaled, info) &&
+                ggml_cuda_should_fuse_scaled_mul_mat_q(info.mm, info.scale, scaled)) {
+            static bool logged = false;
+            if (!logged && ggml_cuda_nvfp4_debug_enabled()) {
+                GGML_LOG_INFO("CUDA NVFP4 native: fusing post-matmul .scale in MMQ epilogue\n");
+                logged = true;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, info.mm->src[0], info.mm->src[1], nullptr, scaled, info.scale);
+            return 1;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_can_fuse_scaled_mul_mat_id(cgraph, i)) {
+        ggml_cuda_scaled_mul_mat_id info;
+        ggml_tensor * scaled = cgraph->nodes[i + 4];
+        if (ggml_cuda_extract_scaled_mul_mat_id(scaled, info) &&
+                ggml_cuda_should_fuse_scaled_mul_mat_q(info.mm, info.scale, scaled)) {
+            static bool logged = false;
+            if (!logged && ggml_cuda_nvfp4_debug_enabled()) {
+                GGML_LOG_INFO("CUDA NVFP4 native: fusing post-mul_mat_id .scale in MMQ epilogue\n");
+                logged = true;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, info.mm->src[0], info.mm->src[1], info.mm->src[2], scaled, info.scale);
+            return 4;
+        }
     }
 
     fused_mul_mat_vec = false;
