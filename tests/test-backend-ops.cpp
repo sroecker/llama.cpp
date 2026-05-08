@@ -4018,6 +4018,66 @@ struct test_mul_mat_scale : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with ModelOpt/NVFP4 activation input_scale metadata.
+struct test_mul_mat_input_scale : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_NVFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_input_scale(ggml_type type_a = GGML_TYPE_NVFP4, int64_t m = 32, int64_t n = 16, int64_t k = 256)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * input_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(input_scale, "input_scale");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        out->src[3] = input_scale;
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "input_scale") == 0) {
+                init_tensor_uniform(t, 0.625f, 0.625f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_INPUT_SCALE";
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -4189,6 +4249,84 @@ struct test_mul_mat_id_scale : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_SCALE";
+    }
+};
+
+// GGML_OP_MUL_MAT_ID with per-expert NVFP4 activation input_scale metadata.
+struct test_mul_mat_id_input_scale : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_NVFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_id_input_scale(ggml_type type_a = GGML_TYPE_NVFP4, int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 16, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * input_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(input_scale, "input_scale");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, x, ids);
+        out->src[3] = input_scale;
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+
+        std::vector<float> scales(n_mats);
+        for (int i = 0; i < n_mats; ++i) {
+            scales[i] = 0.5f + 0.125f * i;
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "input_scale") == 0) {
+                ggml_backend_tensor_set(t, scales.data(), 0, scales.size() * sizeof(float));
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_INPUT_SCALE";
     }
 };
 
@@ -8347,6 +8485,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, false));
     test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, true));
+    test_cases.emplace_back(new test_mul_mat_input_scale(GGML_TYPE_NVFP4, 32, 16, 256));
 
 #if 0
     // test the mat-mat path for Metal
@@ -8399,6 +8538,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, false));
     test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, true));
+    test_cases.emplace_back(new test_mul_mat_id_input_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {

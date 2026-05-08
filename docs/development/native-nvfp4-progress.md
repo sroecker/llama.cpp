@@ -19,9 +19,12 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
-- `.input_scale` tensors are loaded and threaded through the graph helpers, but are intentionally not applied as output multipliers. Applying them directly corrupted the Qwen3.6 NVFP4 prompt sanity check while the activation quantizer is still dynamic.
+- `.input_scale` tensors are loaded, attached to NVFP4 `MUL_MAT`/`MUL_MAT_ID` nodes as metadata, and consumed by the native MMQ activation quantizer. They are not represented as post-matmul graph multipliers.
+- The activation quantizer divides F32 activations by the static `.input_scale` before choosing per-16 UE4M3 scales; the MMQ epilogue multiplies the FP32 accumulator by the product of weight `.scale` and activation `.input_scale`.
+- Dense `.input_scale` uses a scalar tensor. MoE `MUL_MAT_ID` uses the existing `expert_bounds` mapping to select the per-expert activation input scale for the sorted activation rows.
 - `GGML_CUDA_NVFP4_DEBUG=1` now emits a model-load readiness summary for NVFP4 tensors, including `.scale`, `.input_scale`, and K multiple-of-64 coverage.
-- `GGML_CUDA_NVFP4_DEBUG=1` also logs when dense or MoE `.scale` fusion is selected for the native MMQ epilogue.
+- `GGML_CUDA_NVFP4_DEBUG=1` also logs when dense or MoE `.scale` fusion is selected for the native MMQ epilogue and when `.input_scale` is consumed by the MMQ activation quantizer.
+- The opt-in MMQ+GLU fusion is disabled for graph nodes carrying `.input_scale` metadata until that fused path handles the activation tensor scale explicitly.
 - `GGML_CUDA_NVFP4_NATIVE=1` forces the native SM120 path to fail if unavailable. `GGML_CUDA_NVFP4_DEBUG=1` logs the native path. `GGML_CUDA_NVFP4_NATIVE=0` fails closed on this build because there is no safe non-native NVFP4 MMQ fallback specialization in the Blackwell-compiled CUDA path.
 
 ## Local Validation
@@ -42,16 +45,21 @@ CUDA backend correctness:
 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_INPUT_SCALE -b CUDA0
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_INPUT_SCALE -b CUDA0
 ```
 
 Results:
 
 - `MUL_MAT type_a=nvfp4`: 41/41 passed.
 - `MUL_MAT_ID type_a=nvfp4`: 72/72 passed.
-- `test-llama-graph`: passed. This structurally verifies that `input_scale` is not used as a post-matmul multiplier in `build_lora_mm` or `build_lora_mm_id`.
+- `test-llama-graph`: passed. This structurally verifies that `input_scale` is attached to the matmul node as metadata and is not used as a post-matmul multiplier in `build_lora_mm` or `build_lora_mm_id`.
 - `MUL_MAT_SCALE`: 2/2 passed.
 - `MUL_MAT_ID_SCALE`: 2/2 passed.
+- `MUL_MAT_INPUT_SCALE`: 1/1 passed.
+- `MUL_MAT_ID_INPUT_SCALE`: 1/1 passed.
 - Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
+- Debug input-scale smoke: dense and `MUL_MAT_ID` input-scale tests both logged activation `input_scale` consumption in the MMQ quantizer.
 
 Debug readiness smoke test:
 
@@ -88,6 +96,7 @@ Benchmark command:
 | Scale-order graph pass | `6171.70 +/- 8.81 t/s` | `127.10 +/- 0.62 t/s` |
 | Readiness/input-scale guard pass | `6167.98 +/- 9.29 t/s` | `127.14 +/- 0.69 t/s` |
 | Batch-gated `.scale` MMQ epilogue fusion | `6294.69 +/- 3.68 t/s` | `127.01 +/- 0.75 t/s` |
+| Static activation `.input_scale` quantizer | `6248.47 +/- 9.66 t/s` | `127.13 +/- 0.65 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -120,6 +129,21 @@ Default SM120 sanity check:
     -ngl 999 -fa 1 -st --simple-io --no-display-prompt \
     --reasoning off --temp 0 --seed 1 \
     -p 'Paris is the capital of' -n 32
+```
+
+Observed completion:
+
+```text
+Paris is the capital of **France**.
+```
+
+After adding static activation `.input_scale` quantization, the single-turn `llama-cli` check again completed correctly:
+
+```sh
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/llama-cli \
+    -hf sroecker/Qwen3.6-35B-REAP-Pruned-ratio-0.5-NVFP4-GGUF \
+    -ngl 999 -fa 1 --simple-io --reasoning off -st \
+    -p 'Paris is the capital of' -n 24 --temp 0
 ```
 
 Observed completion:

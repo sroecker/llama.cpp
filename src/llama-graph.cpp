@@ -966,16 +966,22 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+static void llm_graph_attach_nvfp4_input_scale(
+          ggml_tensor * mm,
+          ggml_tensor * w,
+          ggml_tensor * w_in_s) {
+    if (w_in_s && w && w->type == GGML_TYPE_NVFP4 && w_in_s->type == GGML_TYPE_F32) {
+        mm->src[3] = w_in_s;
+    }
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s,
           ggml_tensor * w_in_s) const {
-    // ModelOpt input_scale belongs to activation quantization. Applying it as a graph
-    // output multiplier corrupts current Qwen NVFP4 GGUFs with the dynamic quantizer.
-    GGML_UNUSED(w_in_s);
-
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    llm_graph_attach_nvfp4_input_scale(res, w, w_in_s);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1008,10 +1014,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * w_in_s) const {
-    // See build_lora_mm: input_scale is not a post-matmul scale.
-    GGML_UNUSED(w_in_s);
-
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    llm_graph_attach_nvfp4_input_scale(res, w, w_in_s);
 
     if (w_s) {
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, w_s->ne[0], 1);

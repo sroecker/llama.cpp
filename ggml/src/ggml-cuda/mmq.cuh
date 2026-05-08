@@ -3625,6 +3625,7 @@ static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ output_scale, const int output_scale_stride,
+        const float * __restrict__ input_scale, const int input_scale_stride,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -3709,7 +3710,9 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
-        const float output_scale_value = apply_output_scale ? output_scale[output_scale_stride * zt] : 1.0f;
+        const float output_scale_value = apply_output_scale ?
+            (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
+            (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
@@ -3790,7 +3793,9 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
-        const float output_scale_value = apply_output_scale ? output_scale[output_scale_stride * zt] : 1.0f;
+        const float output_scale_value = apply_output_scale ?
+            (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
+            (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
@@ -3860,7 +3865,9 @@ static __global__ void mul_mat_q(
     const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
-    const float output_scale_value = apply_output_scale ? output_scale[output_scale_stride * zt] : 1.0f;
+    const float output_scale_value = apply_output_scale ?
+        (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
+        (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
@@ -4010,6 +4017,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * output_scale; int output_scale_stride;
+    const float * input_scale; int input_scale_stride;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -4337,7 +4345,8 @@ static void launch_mul_mat_q_kernel(
         cudaStream_t stream, float * tmp_fixup, const uint3 blocks_per_ne00_fd, const uint3 channel_ratio_fd,
         const uint3 nchannels_y_fd, const uint3 sample_ratio_fd, const uint3 nsamples_y_fd, const uint3 ntx_fd) {
     mul_mat_q<type, mmq_x, need_check, apply_output_scale><<<block_nums, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, args.output_scale, args.output_scale_stride,
+        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup,
+         args.output_scale, args.output_scale_stride, args.input_scale, args.input_scale_stride,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4350,7 +4359,7 @@ static void launch_mul_mat_q_kernel_maybe_scaled(
         cudaStream_t stream, float * tmp_fixup, const uint3 blocks_per_ne00_fd, const uint3 channel_ratio_fd,
         const uint3 nchannels_y_fd, const uint3 sample_ratio_fd, const uint3 nsamples_y_fd, const uint3 ntx_fd) {
     if constexpr (type == GGML_TYPE_NVFP4) {
-        if (args.output_scale) {
+        if (args.output_scale || args.input_scale) {
             launch_mul_mat_q_kernel<type, mmq_x, need_check, true>(
                 args, block_nums, block_dims, nbytes_shared, stream, tmp_fixup, blocks_per_ne00_fd,
                 channel_ratio_fd, nchannels_y_fd, sample_ratio_fd, nsamples_y_fd, ntx_fd);
@@ -4358,6 +4367,7 @@ static void launch_mul_mat_q_kernel_maybe_scaled(
         }
     } else {
         GGML_ASSERT(args.output_scale == nullptr);
+        GGML_ASSERT(args.input_scale  == nullptr);
     }
 
     launch_mul_mat_q_kernel<type, mmq_x, need_check, false>(
@@ -4584,7 +4594,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst, const ggml_tensor * output_scale = nullptr);
+        ggml_tensor * dst, const ggml_tensor * output_scale = nullptr, const ggml_tensor * input_scale = nullptr);
 
 void ggml_cuda_mul_mat_q_glu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,

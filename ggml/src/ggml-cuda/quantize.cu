@@ -89,11 +89,33 @@ static int get_nvfp4_quant_scale_search_radius(const int cc) {
     return cc == GGML_CUDA_CC_BLACKWELL ? 0 : 2;
 }
 
+static __device__ __forceinline__ int quantize_mmq_nvfp4_input_scale_index(
+        const int64_t i1, const int32_t * __restrict__ expert_bounds, const int n_input_scale) {
+    if (!expert_bounds || n_input_scale <= 1) {
+        return 0;
+    }
+
+    int lo = 0;
+    int hi = n_input_scale;
+    while (lo + 1 < hi) {
+        const int mid = (lo + hi) / 2;
+        if (i1 < expert_bounds[mid]) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    return lo;
+}
+
 template<int scale_search_radius>
 static __global__ void quantize_mmq_nvfp4(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const float * __restrict__ input_scale, const int32_t * __restrict__ expert_bounds,
+        const int n_input_scale, const int input_scale_stride) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
     const int64_t i0_base = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * QK_NVFP4_SUB;
@@ -117,6 +139,14 @@ static __global__ void quantize_mmq_nvfp4(
 
     const int sub = (i0_base % QK_K) / QK_NVFP4_SUB;
 
+    float inv_input_scale = 1.0f;
+    if (input_scale) {
+        const int scale_idx = input_scale_stride == 0 ?
+            0 : quantize_mmq_nvfp4_input_scale_index(i1, expert_bounds, n_input_scale);
+        const float scale = input_scale[input_scale_stride * scale_idx];
+        inv_input_scale = scale > 0.0f ? 1.0f / scale : 1.0f;
+    }
+
     float vals_raw[QK_NVFP4_SUB];
     float amax_raw = 0.0f;
     const int64_t base_idx = i3 * s03 + i2 * s02 + i01 * s01;
@@ -124,7 +154,7 @@ static __global__ void quantize_mmq_nvfp4(
     for (int k = 0; k < QK_NVFP4_SUB; k++) {
         const int64_t i00 = i0_base + k;
         if (i00 < ne00) {
-            const float v = x[base_idx + i00];
+            const float v = x[base_idx + i00] * inv_input_scale;
             vals_raw[k] = v;
             amax_raw = fmaxf(amax_raw, fabsf(v));
         } else {
@@ -188,6 +218,7 @@ static __global__ void quantize_mmq_nvfp4(
     yqs[2 * sub + 1] = q1;
     reinterpret_cast<uint8_t *>(yb->d4)[sub] = fp8_code;
 #else
+    GGML_UNUSED_VARS(input_scale, expert_bounds, n_input_scale, input_scale_stride);
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
@@ -442,8 +473,11 @@ void quantize_mmq_q8_1_cuda(
 void quantize_mmq_fp4_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float * input_scale, const int32_t * expert_bounds, const int n_input_scale, const int input_scale_stride,
+        cudaStream_t stream) {
     GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(!input_scale || type_src0 == GGML_TYPE_NVFP4);
     GGML_ASSERT(ne0 > 0);
 
     if (type_src0 == GGML_TYPE_NVFP4) {
@@ -456,15 +490,18 @@ void quantize_mmq_fp4_cuda(
         switch (get_nvfp4_quant_scale_search_radius(cc)) {
             case 0:
                 quantize_mmq_nvfp4<0><<<num_blocks, block_size, 0, stream>>>(
-                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, input_scale, expert_bounds,
+                    n_input_scale, input_scale_stride);
                 break;
             case 1:
                 quantize_mmq_nvfp4<1><<<num_blocks, block_size, 0, stream>>>(
-                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, input_scale, expert_bounds,
+                    n_input_scale, input_scale_stride);
                 break;
             case 2:
                 quantize_mmq_nvfp4<2><<<num_blocks, block_size, 0, stream>>>(
-                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                    x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, input_scale, expert_bounds,
+                    n_input_scale, input_scale_stride);
                 break;
             default:
                 GGML_ABORT("fatal error");

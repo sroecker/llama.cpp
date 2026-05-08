@@ -135,12 +135,14 @@ static int64_t ggml_cuda_mmq_src1_stride(
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst, const ggml_tensor * output_scale) {
+        ggml_tensor * dst, const ggml_tensor * output_scale, const ggml_tensor * input_scale) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
     GGML_ASSERT(!output_scale || output_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(!output_scale || src0->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(!input_scale  || input_scale->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!input_scale  || src0->type == GGML_TYPE_NVFP4);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -191,9 +193,23 @@ void ggml_cuda_mul_mat_q(
         GGML_ASSERT(ids || ggml_nelements(output_scale) == 1);
         GGML_ASSERT(!ids || output_scale->ne[0] == ne02);
     }
+    if (input_scale) {
+        GGML_ASSERT(use_native_fp4);
+        GGML_ASSERT(ids || ggml_nelements(input_scale) == 1);
+        GGML_ASSERT(!ids || input_scale->ne[0] == ne02);
+    }
 
     const float * output_scale_d      = output_scale ? (const float *) output_scale->data : nullptr;
     const int     output_scale_stride = output_scale ? (ids ? 1 : 0) : 0;
+    const float * input_scale_d       = input_scale  ? (const float *) input_scale->data  : nullptr;
+    const int     input_scale_stride  = input_scale  ? (ids ? 1 : 0) : 0;
+    if (input_scale && ggml_cuda_nvfp4_debug_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("CUDA NVFP4 native: using activation input_scale in MMQ quantizer\n");
+            logged = true;
+        }
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(
@@ -207,7 +223,8 @@ void ggml_cuda_mul_mat_q(
             if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                        ne11, ne12, ne13, stream);
+                                        ne11, ne12, ne13, input_scale_d, nullptr, input_scale ? 1 : 0,
+                                        input_scale_stride, stream);
 
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
@@ -222,6 +239,7 @@ void ggml_cuda_mul_mat_q(
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             output_scale_d, output_scale_stride,
+            input_scale_d, input_scale_stride,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -267,7 +285,8 @@ void ggml_cuda_mul_mat_q(
 
         if (use_native_fp4) {
             quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, input_scale_d, expert_bounds.get(),
+                                    input_scale ? ne02 : 0, input_scale_stride, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -282,6 +301,7 @@ void ggml_cuda_mul_mat_q(
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         output_scale_d, output_scale_stride,
+        input_scale_d, input_scale_stride,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -377,7 +397,7 @@ void ggml_cuda_mul_mat_q_glu(
         const int64_t s13 = src1->nb[3] / ts_src1;
 
         quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_fp4.get(), src0->type, ne10, s11, s12, s13,
-                              ne10_padded, ne_get_rows, 1, 1, stream);
+                              ne10_padded, ne_get_rows, 1, 1, nullptr, nullptr, 0, 0, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -428,6 +448,7 @@ void ggml_cuda_op_mul_mat_q(
                             && src1_ncols == ne11;
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        nullptr, 0,
         nullptr, 0,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,

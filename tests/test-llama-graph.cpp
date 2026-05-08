@@ -81,8 +81,8 @@ static void test_build_lora_mm_input_scale_not_postmul() {
     llm_graph_context graph(params);
     ggml_context * ctx = res.get_ctx();
 
-    ggml_tensor * w      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
-    ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 3);
+    ggml_tensor * w      = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, 64, 4);
+    ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 3);
     ggml_tensor * w_s    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_tensor * w_in_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 
@@ -91,11 +91,12 @@ static void test_build_lora_mm_input_scale_not_postmul() {
     require(out->op == GGML_OP_MUL, "build_lora_mm must apply w_s as an output MUL");
     require(out->src[0] != nullptr && out->src[0]->op == GGML_OP_MUL_MAT, "build_lora_mm scale input must be MUL_MAT");
     require(out->src[1] == w_s, "build_lora_mm must multiply by w_s");
-    require(!graph_contains(out, w_in_s), "build_lora_mm must not apply input_scale as a post-matmul multiplier");
+    require(out->src[0]->src[3] == w_in_s, "build_lora_mm must attach input_scale to MUL_MAT metadata");
+    require(!graph_contains(out->src[1], w_in_s), "build_lora_mm must not apply input_scale as a post-matmul multiplier");
 
     out = graph.build_lora_mm(w, cur, nullptr, w_in_s);
     require(out->op == GGML_OP_MUL_MAT, "build_lora_mm without w_s must return MUL_MAT");
-    require(!graph_contains(out, w_in_s), "build_lora_mm without w_s must still ignore input_scale");
+    require(out->src[3] == w_in_s, "build_lora_mm without w_s must still attach input_scale metadata");
 }
 
 static void test_build_lora_mm_id_input_scale_not_postmul() {
@@ -106,8 +107,8 @@ static void test_build_lora_mm_id_input_scale_not_postmul() {
     llm_graph_context graph(params);
     ggml_context * ctx = res.get_ctx();
 
-    ggml_tensor * w      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 4, 5);
-    ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 2, 3);
+    ggml_tensor * w      = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, 64, 4, 5);
+    ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 2, 3);
     ggml_tensor * ids    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 3);
     ggml_tensor * w_s    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
     ggml_tensor * w_in_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
@@ -119,11 +120,12 @@ static void test_build_lora_mm_id_input_scale_not_postmul() {
     require(out->src[1] != nullptr && out->src[1]->op == GGML_OP_GET_ROWS, "build_lora_mm_id scale branch must select per-expert rows");
     require(out->src[1]->src[0] != nullptr && out->src[1]->src[0]->op == GGML_OP_REPEAT, "build_lora_mm_id scale branch must repeat w_s");
     require(graph_contains(out->src[1], w_s), "build_lora_mm_id scale branch must use w_s");
-    require(!graph_contains(out, w_in_s), "build_lora_mm_id must not apply input_scale as a post-matmul multiplier");
+    require(out->src[0]->src[3] == w_in_s, "build_lora_mm_id must attach input_scale to MUL_MAT_ID metadata");
+    require(!graph_contains(out->src[1], w_in_s), "build_lora_mm_id must not apply input_scale as a post-matmul multiplier");
 
     out = graph.build_lora_mm_id(w, cur, ids, nullptr, w_in_s);
     require(out->op == GGML_OP_MUL_MAT_ID, "build_lora_mm_id without w_s must return MUL_MAT_ID");
-    require(!graph_contains(out, w_in_s), "build_lora_mm_id without w_s must still ignore input_scale");
+    require(out->src[3] == w_in_s, "build_lora_mm_id without w_s must still attach input_scale metadata");
 }
 
 int main() {

@@ -38,4 +38,8 @@ void quantize_mmq_fp4_cuda(const float *   x,
                              int64_t         ne1,
                              int64_t         ne2,
                              int64_t         ne3,
+                             const float *   input_scale,
+                             const int32_t * expert_bounds,
+                             int             n_input_scale,
+                             int             input_scale_stride,
                              cudaStream_t    stream);
