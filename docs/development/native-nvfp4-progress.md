@@ -22,6 +22,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - Split-buffer NVFP4 MMQ now stages runtime activations as FP4 blocks on SM120 instead of q8_1 blocks before enabling split-buffer `x_repacked=true`.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
+- `GGML_CUDA_NVFP4_TRACE_MMQ=1` emits one stderr line per native NVFP4 MMQ dispatch with launch tile count, selected MMQ shape, stream-k/fixup state, scale metadata, `x_repacked` state, `ids` state, tensor dimensions, and tensor names. This is intentionally opt-in because the requested benchmark emits thousands of lines.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -310,6 +311,22 @@ The first opt-in repack-cache prototype passed correctness but did not produce a
 The split-buffer cache follow-up briefly wired the same sidecar through `ggml_tensor_extra_gpu`, but review found that the generic split `MUL_MAT` path still quantized `src1` with the q8_1 MMQ path. That was incompatible with launching the native FP4 `x_repacked=true` MMQ specialization, which expects FP4 activation blocks. The split path now uses the native FP4 activation quantizer for NVFP4 on SM120, carries scalar `input_scale` through the MMQ epilogue, and re-enables split-buffer sidecars. Full-model `--split-mode row` validation remains blocked by an older split-buffer view-tensor allocation assertion before the native NVFP4 kernel is reached.
 
 The optional `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` admission cap was tested to skip the 75 MiB all-expert tensors in this GGUF and bias the cache toward smaller attention/shared-expert weights. Caps of 16 MiB and 32 MiB did not beat the uncapped 128 MiB run, so no default cap is applied.
+
+The follow-up `GGML_CUDA_NVFP4_TRACE_MMQ=1` run on the requested benchmark with a 128 MiB repack budget emitted 16,440 native NVFP4 MMQ dispatch lines. It showed that the full-tensor sidecar cache is structurally mismatched to the dominant MoE all-expert tensors on this 5070 Ti run:
+
+| Dispatch group | Count |
+| --- | ---: |
+| `blocks=70 repacked=no` | `6076` |
+| `blocks=8192 repacked=no` | `4524` |
+| `blocks=70 repacked=yes` | `2764` |
+| `blocks=32768 repacked=no` | `2204` |
+| `blocks=1024 repacked=no` | `464` |
+| `blocks=1024 repacked=yes` | `116` |
+| `blocks=32768 repacked=yes` | `58` |
+
+The uncached large launches are almost entirely `ffn_gate_exps.weight`, `ffn_up_exps.weight`, and `ffn_down_exps.weight`. A single all-expert sidecar is about 75 MiB in this model, so a 128 MiB budget can cover only one of those large layer tensors plus smaller attention/shared-expert tensors. Increasing ordinary first-come full-tensor cache coverage is therefore a poor use of the 16 GB memory envelope: it either caches a small fraction of hot MoE tensors or spends memory on underfilled smaller launches.
+
+The current `x_repacked` loader also assumes the sidecar preserves the original full logical tensor address space. `MUL_MAT_ID` compacts activations and destinations through `ids_src1`, `ids_dst`, and `expert_bounds`, but weight addressing still uses the original expert/channel offset. A compact per-expert sidecar would need new metadata, such as a logical base-block offset and an expert-to-sidecar map, plus a loader path that subtracts/remaps that base. Without that, a partial sidecar would index the wrong expert or go out of bounds. For now the repack cache stays opt-in and whole-tensor only; the next real MoE-side improvement should be an explicit partial/expert sidecar design, not another admission heuristic.
 
 The shared-memory follow-up found a host/device accounting mismatch: host launch sizing used the generic NVFP4 MMA tile stride (`84` int words/row), while the Blackwell native FP4 loader uses the FP4 stride (`76` int words/row). Correcting the host launch size dropped sampled dynamic shared memory from `30.98 Kbyte/block` to `28.93 Kbyte/block`; registers stayed at 128/thread, theoretical occupancy stayed at `25%`, and shared memory still limited the hot `mul_mat_q<NVFP4,64,apply_scale>` specialization to three CTAs/SM.
 

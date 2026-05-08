@@ -5,6 +5,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cinttypes>
+#include <climits>
 
 static int ggml_cuda_nvfp4_native_mode() {
     const char * env = getenv("GGML_CUDA_NVFP4_NATIVE");
@@ -17,6 +19,82 @@ static int ggml_cuda_nvfp4_native_mode() {
 static bool ggml_cuda_nvfp4_debug_enabled() {
     const char * env = getenv("GGML_CUDA_NVFP4_DEBUG");
     return env && std::atoi(env) != 0;
+}
+
+static bool ggml_cuda_nvfp4_trace_mmq_enabled() {
+    const char * env = getenv("GGML_CUDA_NVFP4_TRACE_MMQ");
+    return env && std::atoi(env) != 0;
+}
+
+static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args) {
+    static const bool enabled = ggml_cuda_nvfp4_trace_mmq_enabled();
+    if (!enabled || args.type_x != GGML_TYPE_NVFP4) {
+        return;
+    }
+
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    const int nwarps = mmq_get_nwarps_host_for_type(GGML_TYPE_NVFP4, cc, warp_size);
+    const int mmq_y = get_mmq_y_host_for_type(GGML_TYPE_NVFP4, cc);
+    const int mmq_x_max = get_mmq_x_max_for_type(GGML_TYPE_NVFP4, cc);
+
+    int mmq_x_best = 0;
+    int ntiles_x_best = INT_MAX;
+    int nbytes_shared = 0;
+    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        const int candidate_nbytes_shared = mmq_get_nbytes_shared<GGML_TYPE_NVFP4>(mmq_x, mmq_y, cc, warp_size, nwarps);
+        if (mmq_x % granularity != 0 || candidate_nbytes_shared > (int) smpbo) {
+            continue;
+        }
+
+        const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
+        if (ntiles_x < ntiles_x_best) {
+            mmq_x_best = mmq_x;
+            ntiles_x_best = ntiles_x;
+            nbytes_shared = candidate_nbytes_shared;
+        }
+    }
+
+    if (mmq_x_best == 0) {
+        return;
+    }
+
+    const int nty = (args.nrows_x + mmq_y - 1) / mmq_y;
+    const int ntx = (args.ncols_max + mmq_x_best - 1) / mmq_x_best;
+    const int ntzw = args.nchannels_y * args.nsamples_y;
+    const int ntiles_dst = ntx * nty * ntzw;
+
+    int blocks_x = ntiles_dst;
+    bool fixup_needed = false;
+    if (args.use_stream_k) {
+        const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+        const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm * tiles_nwaves);
+        const int tiles_efficiency_min = get_mmq_stream_k_efficiency_min(cc);
+        blocks_x = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= tiles_efficiency_min ? ntiles_dst : nsm;
+        fixup_needed = ntiles_dst % blocks_x != 0;
+    }
+
+    const char * x_name = args.x_name && args.x_name[0] ? args.x_name : "(unnamed)";
+    const char * dst_name = args.dst_name && args.dst_name[0] ? args.dst_name : "(unnamed)";
+    fprintf(stderr,
+        "CUDA NVFP4 MMQ trace:"
+        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s ids=%s out_scale=%s in_scale=%s"
+        " dims=(k=%" PRId64 ",rows=%" PRId64 ",cols=%" PRId64 ",max_cols=%" PRId64 ",ch=%" PRId64 ",samples=%" PRId64 ")"
+        " weight=%s dst=%s\n",
+        blocks_x, ntiles_dst, mmq_x_best, mmq_y, nbytes_shared,
+        args.use_stream_k ? "yes" : "no",
+        fixup_needed ? "yes" : "no",
+        args.x_repacked ? "yes" : "no",
+        args.ids_dst ? "yes" : "no",
+        args.output_scale ? "yes" : "no",
+        args.input_scale ? "yes" : "no",
+        args.ncols_x, args.nrows_x, args.ncols_dst, args.ncols_max, args.nchannels_y, args.nsamples_y,
+        x_name, dst_name);
+    fflush(stderr);
 }
 
 static bool ggml_cuda_nvfp4_native_available(const int cc) {
@@ -81,6 +159,8 @@ void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, const int64_t
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    ggml_cuda_nvfp4_mmq_trace(args);
+
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
@@ -303,7 +383,8 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1,
-            use_repack_cache};
+            use_repack_cache,
+            src0->name, dst->name};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -366,7 +447,8 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12,
-        use_repack_cache};
+        use_repack_cache,
+        src0->name, dst->name};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -533,7 +615,8 @@ void ggml_cuda_op_mul_mat_q(
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
         use_stream_k, src1_ncols,
-        src0_repacked_i};
+        src0_repacked_i,
+        src0->name, dst->name};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

@@ -4116,6 +4116,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
     bool x_repacked;
+    const char * x_name; const char * dst_name;
 };
 
 template<ggml_type type>
