@@ -17,6 +17,10 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti memory pressure reduction by sizing native FP4 activation scratch as FP4 blocks instead of Q8 blocks.
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
+- NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
+- `.input_scale` tensors are loaded and threaded through the graph helpers, but are intentionally not applied as output multipliers. Applying them directly corrupted the Qwen3.6 NVFP4 prompt sanity check while the activation quantizer is still dynamic.
+- `GGML_CUDA_NVFP4_DEBUG=1` now emits a model-load readiness summary for NVFP4 tensors, including `.scale`, `.input_scale`, and K multiple-of-64 coverage.
+- `GGML_CUDA_NVFP4_NATIVE=1` forces the native SM120 path to fail if unavailable. `GGML_CUDA_NVFP4_DEBUG=1` logs the native path. `GGML_CUDA_NVFP4_NATIVE=0` fails closed on this build because there is no safe non-native NVFP4 MMQ fallback specialization in the Blackwell-compiled CUDA path.
 
 ## Local Validation
 
@@ -31,12 +35,34 @@ CUDA backend correctness:
 ```sh
 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID -b CUDA0 -p 'type_a=nvfp4'
+./build-cuda/bin/test-llama-graph
+./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CUDA0
+./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
 ```
 
 Results:
 
 - `MUL_MAT type_a=nvfp4`: 41/41 passed.
 - `MUL_MAT_ID type_a=nvfp4`: 72/72 passed.
+- `test-llama-graph`: passed. This structurally verifies that `input_scale` is not used as a post-matmul multiplier in `build_lora_mm` or `build_lora_mm_id`.
+- `MUL_MAT_SCALE`: 2/2 passed.
+- `MUL_MAT_ID_SCALE`: 2/2 passed.
+
+Debug readiness smoke test:
+
+```sh
+GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/llama-cli \
+    -hf sroecker/Qwen3.6-35B-REAP-Pruned-ratio-0.5-NVFP4-GGUF \
+    -ngl 999 -fa 1 -st --reasoning off --no-display-prompt --temp 0 --seed 1 \
+    -p 'Paris is the capital of' -n 1
+```
+
+Observed readiness summary:
+
+```text
+CUDA NVFP4 native readiness: nvfp4 tensors = 280, known matmul weights = 280, with .scale = 280, with .input_scale metadata = 280
+CUDA NVFP4 native readiness: input_scale is activation-quantization metadata and is not applied as a post-matmul multiplier
+```
 
 Benchmark command:
 
@@ -54,6 +80,8 @@ Benchmark command:
 | `GGML_CUDA_NVFP4_MMQ_GLU=1` | `5586.75 +/- 4.66 t/s` | `126.18 +/- 0.57 t/s` |
 | SM120 default `NVFP4_MMQ_X_MAX=64` | `5611.50 +/- 11.64 t/s` | `127.04 +/- 0.80 t/s` |
 | SM120 default cap 64 + quant radius 0 | `6165.73 +/- 4.41 t/s` | `127.12 +/- 0.70 t/s` |
+| Scale-order graph pass | `6171.70 +/- 8.81 t/s` | `127.10 +/- 0.62 t/s` |
+| Readiness/input-scale guard pass | `6167.98 +/- 9.29 t/s` | `127.14 +/- 0.69 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -72,13 +100,19 @@ Observed completion:
 Paris is the capital of **France**.
 ```
 
+After the scale-order pass, the same prompt completed correctly:
+
+```text
+Paris is the capital of **France**.
+```
+
 Default SM120 sanity check:
 
 ```sh
 ./build-cuda/bin/llama-cli \
     -hf sroecker/Qwen3.6-35B-REAP-Pruned-ratio-0.5-NVFP4-GGUF \
-    -ngl 999 -fa 1 --reasoning off --no-warmup --temp 0 \
-    -p 'Paris is the capital of' -n 16 --simple-io
+    -ngl 999 -fa 1 -st --reasoning off --no-display-prompt --temp 0 --seed 1 \
+    -p 'Paris is the capital of' -n 16
 ```
 
 Observed completion:

@@ -72,6 +72,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -2384,6 +2385,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static bool ggml_cuda_nvfp4_mmq_glu_enabled() {
     static const bool enabled = [] {
+        const char * native_env = getenv("GGML_CUDA_NVFP4_NATIVE");
+        if (native_env != nullptr && std::strcmp(native_env, "0") == 0) {
+            return false;
+        }
         const char * env = getenv("GGML_CUDA_NVFP4_MMQ_GLU");
         return env != nullptr && std::atoi(env) != 0;
     }();

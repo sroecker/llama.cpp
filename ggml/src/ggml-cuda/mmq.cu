@@ -3,6 +3,49 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
+static int ggml_cuda_nvfp4_native_mode() {
+    const char * env = getenv("GGML_CUDA_NVFP4_NATIVE");
+    if (!env || strcmp(env, "auto") == 0) {
+        return -1;
+    }
+    return std::atoi(env) != 0 ? 1 : 0;
+}
+
+static bool ggml_cuda_nvfp4_debug_enabled() {
+    const char * env = getenv("GGML_CUDA_NVFP4_DEBUG");
+    return env && std::atoi(env) != 0;
+}
+
+static bool ggml_cuda_nvfp4_native_available(const int cc) {
+    const int mode = ggml_cuda_nvfp4_native_mode();
+
+    if (mode == 0) {
+        GGML_ABORT("GGML_CUDA_NVFP4_NATIVE=0 requested, but this build has no safe non-native NVFP4 MMQ fallback");
+    }
+
+    if (!blackwell_mma_available(cc)) {
+        if (mode == 1) {
+            GGML_ABORT("GGML_CUDA_NVFP4_NATIVE=1 requested, but SM120/SM121 FP4 MMA is unavailable");
+        }
+        static bool logged = false;
+        if (!logged && ggml_cuda_nvfp4_debug_enabled()) {
+            GGML_LOG_INFO("CUDA NVFP4 native: disabled, unsupported compute capability sm_%d\n", cc / 10);
+            logged = true;
+        }
+        return false;
+    }
+
+    static bool logged = false;
+    if (!logged && (mode == 1 || ggml_cuda_nvfp4_debug_enabled())) {
+        GGML_LOG_INFO("CUDA NVFP4 native: enabled, arch sm_%d, kernel mma.sync mxf4nvf4 scale_vec::4X\n", cc / 10);
+        logged = true;
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -137,7 +180,8 @@ void ggml_cuda_mul_mat_q(
     const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const bool use_native_fp4 = src0->type == GGML_TYPE_MXFP4 ? blackwell_mma_available(cc) :
+                                src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_nvfp4_native_available(cc) : false;
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(

@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -288,6 +289,140 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             GGML_ABORT("unimplemented model class");
     }
 
+}
+
+static bool llama_model_nvfp4_debug_enabled() {
+    const char * env = std::getenv("GGML_CUDA_NVFP4_DEBUG");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+struct llama_nvfp4_readiness {
+    int n_weight             = 0;
+    int n_with_scale         = 0;
+    int n_with_input_scale   = 0;
+    int n_missing_scale      = 0;
+    int n_missing_input_scale = 0;
+    int n_k_tail             = 0;
+
+    std::string first_missing_scale;
+    std::string first_missing_input_scale;
+    std::string first_k_tail;
+};
+
+static void llama_model_count_nvfp4_weight(
+        llama_nvfp4_readiness       & stats,
+        std::vector<const ggml_tensor *> & known,
+        const ggml_tensor           * w,
+        const ggml_tensor           * w_s,
+        const ggml_tensor           * w_in_s) {
+    if (w == nullptr || w->type != GGML_TYPE_NVFP4) {
+        return;
+    }
+
+    known.push_back(w);
+    stats.n_weight++;
+
+    if (w_s != nullptr) {
+        stats.n_with_scale++;
+    } else {
+        stats.n_missing_scale++;
+        if (stats.first_missing_scale.empty()) {
+            stats.first_missing_scale = ggml_get_name(w);
+        }
+    }
+
+    if (w_in_s != nullptr) {
+        stats.n_with_input_scale++;
+    } else {
+        stats.n_missing_input_scale++;
+        if (stats.first_missing_input_scale.empty()) {
+            stats.first_missing_input_scale = ggml_get_name(w);
+        }
+    }
+
+    if (w->ne[0] % 64 != 0) {
+        stats.n_k_tail++;
+        if (stats.first_k_tail.empty()) {
+            stats.first_k_tail = ggml_get_name(w);
+        }
+    }
+}
+
+static void llama_model_log_nvfp4_readiness(const llama_model_base & model) {
+    if (!llama_model_nvfp4_debug_enabled()) {
+        return;
+    }
+
+    llama_nvfp4_readiness stats;
+    std::vector<const ggml_tensor *> known;
+
+    for (const llama_layer & layer : model.layers) {
+        llama_model_count_nvfp4_weight(stats, known, layer.wq,           layer.wq_s,           layer.wq_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.wk,           layer.wk_s,           layer.wk_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.wv,           layer.wv_s,           layer.wv_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.wo,           layer.wo_s,           layer.wo_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.wqkv,         layer.wqkv_s,         layer.wqkv_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.wqkv_gate,    layer.wqkv_gate_s,    layer.wqkv_gate_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_gate,     layer.ffn_gate_s,     layer.ffn_gate_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_up,       layer.ffn_up_s,       layer.ffn_up_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_down,     layer.ffn_down_s,     layer.ffn_down_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_gate_exps, layer.ffn_gate_exps_s, layer.ffn_gate_exps_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_up_exps,   layer.ffn_up_exps_s,   layer.ffn_up_exps_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_down_exps, layer.ffn_down_exps_s, layer.ffn_down_exps_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_gate_up_exps, layer.ffn_gate_up_exps_s, layer.ffn_gate_up_exps_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_gate_shexp, layer.ffn_gate_shexp_s, layer.ffn_gate_shexp_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_up_shexp,   layer.ffn_up_shexp_s,   layer.ffn_up_shexp_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ffn_down_shexp, layer.ffn_down_shexp_s, layer.ffn_down_shexp_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ssm_in,       layer.ssm_in_s,       layer.ssm_in_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ssm_out,      layer.ssm_out_s,      layer.ssm_out_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ssm_alpha,    layer.ssm_alpha_s,    layer.ssm_alpha_in_s);
+        llama_model_count_nvfp4_weight(stats, known, layer.ssm_beta,     layer.ssm_beta_s,     layer.ssm_beta_in_s);
+    }
+
+    int n_total_nvfp4 = 0;
+    int n_other_nvfp4 = 0;
+    std::string first_other_nvfp4;
+
+    for (const auto & tensor : model.tensors_by_name) {
+        const ggml_tensor * cur = tensor.second;
+        if (cur == nullptr || cur->type != GGML_TYPE_NVFP4) {
+            continue;
+        }
+
+        n_total_nvfp4++;
+        if (std::find(known.begin(), known.end(), cur) == known.end()) {
+            n_other_nvfp4++;
+            if (first_other_nvfp4.empty()) {
+                first_other_nvfp4 = tensor.first;
+            }
+        }
+    }
+
+    if (n_total_nvfp4 == 0) {
+        return;
+    }
+
+    LLAMA_LOG("%s: CUDA NVFP4 native readiness: nvfp4 tensors = %d, known matmul weights = %d, with .scale = %d, with .input_scale metadata = %d\n",
+            __func__, n_total_nvfp4, stats.n_weight, stats.n_with_scale, stats.n_with_input_scale);
+    LLAMA_LOG("%s: CUDA NVFP4 native readiness: input_scale is activation-quantization metadata and is not applied as a post-matmul multiplier\n",
+            __func__);
+
+    if (stats.n_missing_scale > 0) {
+        LLAMA_LOG("%s: CUDA NVFP4 native readiness: %d known NVFP4 matmul weights missing .scale, first = %s\n",
+                __func__, stats.n_missing_scale, stats.first_missing_scale.c_str());
+    }
+    if (stats.n_missing_input_scale > 0) {
+        LLAMA_LOG("%s: CUDA NVFP4 native readiness: %d known NVFP4 matmul weights missing .input_scale, first = %s; dynamic activation quantization remains in use\n",
+                __func__, stats.n_missing_input_scale, stats.first_missing_input_scale.c_str());
+    }
+    if (stats.n_k_tail > 0) {
+        LLAMA_LOG("%s: CUDA NVFP4 native readiness: %d known NVFP4 matmul weights have K not divisible by 64, first = %s\n",
+                __func__, stats.n_k_tail, stats.first_k_tail.c_str());
+    }
+    if (n_other_nvfp4 > 0) {
+        LLAMA_LOG("%s: CUDA NVFP4 native readiness: %d NVFP4 tensors are outside the current known matmul metadata scan, first = %s\n",
+                __func__, n_other_nvfp4, first_other_nvfp4.c_str());
+    }
 }
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
@@ -1324,6 +1459,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.ffn_gate_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_gate_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
             if (!layer.ssm_in_s && layer.ssm_in) {
@@ -1376,6 +1514,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.ffn_gate_up_exps_in_s && layer.ffn_gate_up_exps) {
+                layer.ffn_gate_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
@@ -1408,6 +1549,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+
+    llama_model_log_nvfp4_readiness(*this);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());

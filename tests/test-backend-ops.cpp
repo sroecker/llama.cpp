@@ -3952,6 +3952,72 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with an explicit output scale tensor.
+struct test_mul_mat_scale : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool bias;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, bias);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_NVFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_scale(ggml_type type_a = GGML_TYPE_NVFP4, int64_t m = 32, int64_t n = 16, int64_t k = 256, bool bias = false)
+        : type_a(type_a), m(m), n(n), k(k), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * explicit_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(explicit_scale, "explicit_scale");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul_mat(ctx, a, b), explicit_scale);
+
+        if (bias) {
+            ggml_tensor * bias_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(bias_t, "bias");
+            out = ggml_add(ctx, out, bias_t);
+        }
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "explicit_scale") == 0) {
+                init_tensor_uniform(t, 0.625f, 0.625f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SCALE";
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -4036,6 +4102,93 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// GGML_OP_MUL_MAT_ID with selected per-expert explicit output scales.
+struct test_mul_mat_id_scale : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool bias;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_used, b, m, n, k, bias);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_NVFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_id_scale(ggml_type type_a = GGML_TYPE_NVFP4, int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 16, int64_t k = 256, bool bias = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), bias(bias) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(scale, "explicit_scale");
+        scale = ggml_reshape_3d(ctx, scale, 1, n_mats, 1);
+        scale = ggml_repeat_4d(ctx, scale, 1, n_mats, n, 1);
+        scale = ggml_get_rows(ctx, scale, ids);
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul_mat_id(ctx, as, x, ids), scale);
+
+        if (bias) {
+            ggml_tensor * bias_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n_mats);
+            ggml_set_name(bias_t, "bias");
+            out = ggml_add_id(ctx, out, bias_t, ids);
+        }
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+
+        std::vector<float> scales(n_mats);
+        for (int i = 0; i < n_mats; ++i) {
+            scales[i] = 0.5f + 0.125f * i;
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "explicit_scale") == 0) {
+                ggml_backend_tensor_set(t, scales.data(), 0, scales.size() * sizeof(float));
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SCALE";
     }
 };
 
@@ -8192,6 +8345,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, false));
+    test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, true));
 
 #if 0
     // test the mat-mat path for Metal
@@ -8242,6 +8397,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, false));
+    test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, true));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
