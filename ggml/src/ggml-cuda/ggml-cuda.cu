@@ -693,6 +693,13 @@ static int64_t ggml_cuda_nvfp4_repack_cache_ngroups_from_nblocks(const size_t nb
     return nblocks % blocks_per_group == 0 ? nblocks / blocks_per_group : 0;
 }
 
+static int64_t ggml_cuda_nvfp4_repack_cache_capacity_ngroups(const ggml_cuda_nvfp4_repack_cache * cache) {
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+    constexpr int ints_per_group   = MMQ_ITER_K_FP4 / 8 + blocks_per_group;
+
+    return cache == nullptr ? 0 : cache->size / (ints_per_group * sizeof(uint32_t));
+}
+
 static size_t ggml_cuda_nvfp4_repack_cache_nbytes(const ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_NVFP4 || tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
         return 0;
@@ -830,9 +837,15 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_nvfp4_repack_cache * cache = ggml_cuda_nvfp4_get_repack_cache(tensor);
     if (cache != nullptr) {
-        if (offset == 0 && size == ggml_nbytes(tensor)) {
-            const int64_t nblocks = ggml_nbytes(tensor) / sizeof(block_nvfp4);
-            ggml_cuda_nvfp4_repack_mmq_cuda((const char *) tensor->data, cache->data, nblocks, cudaStreamPerThread);
+        constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+        constexpr size_t bytes_per_group = blocks_per_group * sizeof(block_nvfp4);
+
+        if (offset % bytes_per_group == 0 && size > 0 && size % bytes_per_group == 0 &&
+                size / bytes_per_group <= size_t(ggml_cuda_nvfp4_repack_cache_capacity_ngroups(cache))) {
+            cache->base_group = offset / bytes_per_group;
+            cache->ngroups = size / bytes_per_group;
+            ggml_cuda_nvfp4_repack_mmq_range_cuda(
+                (const char *) tensor->data, cache->data, cache->base_group, cache->ngroups, cudaStreamPerThread);
             CUDA_CHECK(cudaGetLastError());
             cache->ready = true;
         } else {
@@ -1224,6 +1237,8 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
             const int64_t nblocks = original_size / sizeof(block_nvfp4);
             ggml_cuda_nvfp4_repack_mmq_cuda((const char *) extra->data_device[id], cache->data, nblocks, cudaStreamPerThread);
             CUDA_CHECK(cudaGetLastError());
+            cache->base_group = 0;
+            cache->ngroups = ggml_cuda_nvfp4_repack_cache_ngroups_from_nblocks(nblocks);
             cache->ready = true;
         }
     }

@@ -1195,6 +1195,7 @@ static inline ggml_cuda_nvfp4_repack_cache * ggml_cuda_nvfp4_get_repack_cache(co
 }
 
 void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, int64_t nblocks, cudaStream_t stream);
+void ggml_cuda_nvfp4_repack_mmq_range_cuda(const char * src, void * dst, int64_t base_group, int64_t ngroups, cudaStream_t stream);
 
 
 #if (defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS)) || defined(GGML_MUSA_GRAPHS)
