@@ -19,6 +19,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - Host shared-memory launch sizing now uses the Blackwell FP4 X-tile stride for NVFP4, matching the actual device-side native FP4 loader layout instead of the larger generic NVFP4 fallback stride.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
+- The canonical and repacked SM120 NVFP4 loaders now use a block-major warp mapping: one warp stages one row at a time, with its 32 lanes covering four adjacent 8-word NVFP4 blocks per phase. This keeps the shared tile ABI unchanged while reducing the hot loader's global sector waste.
 - The Blackwell FP4 MMA dot loop now loads each B fragment immediately before the fragment's MMA work and uses an explicit per-output accumulator base, shortening B fragment lifetime without changing the shared layout, tile geometry, or scale semantics.
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - Repack sidecars now carry `base_group` and `ngroups` metadata. Current full-tensor and split-buffer sidecars use `base_group=0`, while the repacked SM120 loader subtracts the base group from the logical group index. This is a scaffold for later partial/expert-local sidecars; no sparse expert remapping is admitted yet.
@@ -143,6 +144,7 @@ Benchmark command:
 | Repack base-offset sidecar metadata scaffold | `6477.28 +/- 12.13 t/s` | `126.88 +/- 0.83 t/s` |
 | Repack exact-range admission scaffold | `6478.72 +/- 12.79 t/s` | `126.73 +/- 0.81 t/s` |
 | Active-expert sidecar scratch, default disabled | `6459.71 +/- 12.99 t/s` | `126.89 +/- 0.82 t/s` |
+| Block-major canonical/repacked NVFP4 loader | `6476.31 +/- 9.50 t/s` | `126.93 +/- 0.78 t/s` |
 | Dropped partial active sidecar, `ACTIVE_REPACK_MAX_EXPERTS=96` | `4249.13 +/- 8.37 t/s` | `126.94 +/- 0.85 t/s` |
 | Dropped bank-ordered NVFP4 row loader | `6447.84 +/- 14.36 t/s` | `126.88 +/- 0.89 t/s` |
 
@@ -375,9 +377,12 @@ A bank-ordered NVFP4 row-loader experiment kept the same shared-memory layout bu
 
 A no-fixup stream-k specialization was tested for the common full-tile launch where `fixup_needed == false`. It compiled the hot `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` stack frame down from 64 to 48 bytes, but did not improve runtime: the sampled 8192-block launch regressed from `145.06 us` to `147.87 us`, and the requested benchmark measured `6462.88 +/- 12.57 t/s` pp15000 and `126.94 +/- 0.86 t/s` tg128. The extra template variant was dropped.
 
+The kept block-major loader changes the row staging schedule without changing the shared-memory tile ABI. Instead of a warp staging four rows with eight lanes per row, a warp stages one row and covers four adjacent NVFP4 blocks per phase. Focused CUDA tests passed for `MUL_MAT_NVFP4_NATIVE`, `MUL_MAT_ID type_a=nvfp4`, and dense `MUL_MAT type_a=nvfp4` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64`. The requested benchmark measured `6476.31 +/- 9.50 t/s` pp15000 and `126.93 +/- 0.78 t/s` tg128. Fresh `ncu` on the first 8192-block MoE launch measured `139.81 us`, 128 registers/thread, `28.93 Kbyte/block` dynamic shared memory, 22.95% achieved occupancy, and 0.39 eligible warps/scheduler. Compared with the previous current-load sample, global excessive sectors dropped from `4,685,360 / 10,561,840` to `3,149,360 / 9,025,840`, shared excessive wavefronts stayed at the improved `307,200`, and DRAM bandwidth rose from `559.94 Gbyte/s` to `580.65 Gbyte/s`.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
+- `llama-cli -st --reasoning off` after the block-major loader completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-cli -st --reasoning off` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=128` completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-cli -st --reasoning off` after the shared-size accounting fix completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-completion -no-cnv` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed the raw prompt with `France`.

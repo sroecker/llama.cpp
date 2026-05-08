@@ -1040,21 +1040,21 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
     constexpr int blocks_per_row = iter_k / QK_NVFP4;
     constexpr int words_per_block = QK_NVFP4 / 8;
     static_assert(blocks_per_row == words_per_block, "NVFP4 MMQ loader assumes one lane per 32-bit q word");
-    constexpr int threads_per_row = blocks_per_row;
-    constexpr int rows_per_warp = warp_size / threads_per_row;
+    constexpr int blocks_per_phase = warp_size / words_per_block;
+    static_assert(blocks_per_row % blocks_per_phase == 0, "NVFP4 MMQ loader assumes an even block phase");
 
     uint32_t * x_u32 = (uint32_t *) x_tile;
 
     const int txi = threadIdx.x;
-    const int word_in_block = txi % threads_per_row;
-    const int row_in_warp = txi / threads_per_row;
+    const int word_in_block = txi % words_per_block;
+    const int block_in_phase = txi / words_per_block;
 
     const block_nvfp4 * bxi_base = (const block_nvfp4 *) x + kbx0;
-    uint32_t * x_u32_scale = x_u32 + 64 + word_in_block;
+    uint32_t * x_u32_scale = x_u32 + 64;
 
 #pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += rows_per_warp * nwarps) {
-        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
 
         if constexpr (need_check) {
             i = min(i, i_max);
@@ -1064,12 +1064,15 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
         const int row_base = i * MMQ_MMA_TILE_X_K_FP4;
 
 #pragma unroll
-        for (int kb = 0; kb < blocks_per_row; ++kb) {
+        for (int kb0 = 0; kb0 < blocks_per_row; kb0 += blocks_per_phase) {
+            const int kb = kb0 + block_in_phase;
             const uint32_t * src_qs = reinterpret_cast<const uint32_t *>(bxi[kb].qs);
             x_u32[row_base + 8 * kb + word_in_block] = src_qs[word_in_block];
         }
 
-        x_u32_scale[row_base] = get_int_b4(bxi[word_in_block].d, 0);
+        if (txi < blocks_per_row) {
+            x_u32_scale[row_base + txi] = get_int_b4(bxi[txi].d, 0);
+        }
     }
 }
 
@@ -1089,21 +1092,21 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4_repacked(const cha
     constexpr int q_words_per_group = blocks_per_row * words_per_block;
     constexpr int scale_words_per_group = blocks_per_row;
     constexpr int words_per_group = q_words_per_group + scale_words_per_group;
-    constexpr int threads_per_row = blocks_per_row;
-    constexpr int rows_per_warp = warp_size / threads_per_row;
+    constexpr int blocks_per_phase = warp_size / words_per_block;
+    static_assert(blocks_per_row % blocks_per_phase == 0, "NVFP4 MMQ loader assumes an even block phase");
 
     uint32_t * x_u32 = (uint32_t *) x_tile;
     uint32_t * x_u32_scale = x_u32 + 64;
     const uint32_t * x_repacked = (const uint32_t *) x;
 
     const int txi = threadIdx.x;
-    const int word_in_block = txi % threads_per_row;
-    const int row_in_warp = txi / threads_per_row;
+    const int word_in_block = txi % words_per_block;
+    const int block_in_phase = txi / words_per_block;
     const int k_group = kbx0 / blocks_per_row;
 
 #pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += rows_per_warp * nwarps) {
-        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
 
         if constexpr (need_check) {
             i = min(i, i_max);
@@ -1114,11 +1117,14 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4_repacked(const cha
         const int row_base = i * MMQ_MMA_TILE_X_K_FP4;
 
 #pragma unroll
-        for (int kb = 0; kb < blocks_per_row; ++kb) {
+        for (int kb0 = 0; kb0 < blocks_per_row; kb0 += blocks_per_phase) {
+            const int kb = kb0 + block_in_phase;
             x_u32[row_base + words_per_block * kb + word_in_block] = src_group[words_per_block * kb + word_in_block];
         }
 
-        x_u32_scale[row_base + word_in_block] = src_group[q_words_per_group + word_in_block];
+        if (txi < scale_words_per_group) {
+            x_u32_scale[row_base + txi] = src_group[q_words_per_group + txi];
+        }
     }
 }
 
