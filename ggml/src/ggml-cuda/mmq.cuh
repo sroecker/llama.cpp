@@ -1170,25 +1170,21 @@ static __device__ __forceinline__ void vec_dot_fp4_fp4_mma(const int * __restric
 
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
-        tile_B   B[nfrags];
-        uint32_t scaleB[nfrags];
-
 #pragma unroll
         for (int frag = 0; frag < nfrags; ++frag) {
             const int k0 = frag * tile_B::J;
-            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
-            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
-        }
+            tile_B B;
+            load_generic(B, y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
+            const uint32_t scaleB = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
 
 #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
-#pragma unroll
-            for (int frag = 0; frag < nfrags; ++frag) {
+            for (int n = 0; n < ntx; ++n) {
+                float * sum_jn = sum + (j0 / tile_C::J + n) * tile_C::ne;
                 tile_C C = {};
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled_fp4<type>(C, A[n][frag], B, scaleA[n][frag], scaleB);
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];
+                    sum_jn[l] += C.x[l];
                 }
             }
         }

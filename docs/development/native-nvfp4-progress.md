@@ -19,6 +19,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - Host shared-memory launch sizing now uses the Blackwell FP4 X-tile stride for NVFP4, matching the actual device-side native FP4 loader layout instead of the larger generic NVFP4 fallback stride.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
+- The Blackwell FP4 MMA dot loop now loads each B fragment immediately before the fragment's MMA work and uses an explicit per-output accumulator base, shortening B fragment lifetime without changing the shared layout, tile geometry, or scale semantics.
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - Split-buffer NVFP4 MMQ now stages runtime activations as FP4 blocks on SM120 instead of q8_1 blocks before enabling split-buffer `x_repacked=true`.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
@@ -57,6 +58,7 @@ GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_INPUT_SC
 GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_NVFP4_NATIVE -b CUDA0
 GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops perf -o MUL_MAT_NVFP4_NATIVE -b CUDA0
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
+./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=mxfp4'
 ```
 
 Results:
@@ -74,6 +76,7 @@ Results:
 - Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
 - Debug input-scale smoke: dense and `MUL_MAT_ID` input-scale tests both logged activation `input_scale` consumption in the MMQ quantizer.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` `MUL_MAT type_a=nvfp4`: 41/41 passed, with the debug log confirming that the sidecar MMQ weight loader was selected on eligible k=1024 cases.
+- `MUL_MAT type_a=mxfp4`: 41/41 passed after the shared Blackwell FP4 dot-loop lifetime change.
 
 Debug readiness smoke test:
 
@@ -126,6 +129,7 @@ Benchmark command:
 | Experimental split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=32` | `6489.24 +/- 3.86 t/s` | `126.86 +/- 0.84 t/s` |
 | Split sidecar gated off + `CACHE_MB=128` sanity, `-r 1` | `6511.15 +/- 0.00 t/s` | `126.08 +/- 0.00 t/s` |
 | Split native FP4 staging + `CACHE_MB=128` sanity, `-r 1` | `6510.95 +/- 0.00 t/s` | `126.06 +/- 0.00 t/s` |
+| Blackwell FP4 B-fragment lifetime pass | `6484.09 +/- 11.69 t/s` | `126.97 +/- 0.84 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -333,6 +337,8 @@ The active-expert trace level was tested on a `p512` smoke run. Across 234 MoE M
 The shared-memory follow-up found a host/device accounting mismatch: host launch sizing used the generic NVFP4 MMA tile stride (`84` int words/row), while the Blackwell native FP4 loader uses the FP4 stride (`76` int words/row). Correcting the host launch size dropped sampled dynamic shared memory from `30.98 Kbyte/block` to `28.93 Kbyte/block`; registers stayed at 128/thread, theoretical occupancy stayed at `25%`, and shared memory still limited the hot `mul_mat_q<NVFP4,64,apply_scale>` specialization to three CTAs/SM.
 
 A fresh `ncu` sample of the current kept `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` specialization on the first 8192-block MoE launch reported `145.06 us`, 128 registers/thread, `28,928` bytes dynamic shared memory/block, 25% theoretical occupancy, 22.83% achieved occupancy, 0.36 eligible warps/scheduler, 63.45% DRAM throughput, and 47.61% SM throughput. The main reported issues remain memory pressure and uncoalesced/shared traffic: global load useful bytes were about `17.2 / 32 B`, shared stores had 1.6-way conflicts with 798,628 bank conflicts, and stall sampling was led by long scoreboard, wait, MIO throttle, and LG throttle.
+
+The kept FP4 dot-loop lifetime pass changed only `vec_dot_fp4_fp4_mma`: B fragments are loaded one fragment at a time immediately before their MMA work, and the accumulator pointer is hoisted per `j0,n` output tile. This leaves the shared layout, row stride, stream-k behavior, tile shape, and block-scale semantics unchanged. `cuobjdump` remained at 128 registers/thread and a 64-byte stack for the hot no-check/apply-scale specialization. The same first 8192-block MoE `ncu` sample measured `144.80 us`, 22.86% achieved occupancy, `17.2 / 32 B` global-load useful bytes, and 793,948 shared-store bank conflicts. The requested benchmark measured `6484.09 +/- 11.69 t/s` pp15000 and `126.97 +/- 0.84 t/s` tg128, so the change is kept as a small pressure-neutral cleanup with a slight positive signal.
 
 A 48-row, 3-warp NVFP4 tile was tested and dropped. It satisfies `nwarps * tile_C::I == mmq_y`, but it violates the `ntx=2` row-pairing requirement used when `mmq_x >= 48`; focused NVFP4 tests caught an illegal memory access. A safer `MMQ_X_MAX=32` sweep can fit under the 4-CTA shared-memory threshold with the corrected accounting, but it regressed pp15000 to `6103.98 +/- 13.44 t/s`, so the default stays at `MMQ_X_MAX=64`.
 
