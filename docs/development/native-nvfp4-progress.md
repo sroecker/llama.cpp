@@ -147,6 +147,7 @@ Benchmark command:
 | Block-major canonical/repacked NVFP4 loader | `6476.31 +/- 9.50 t/s` | `126.93 +/- 0.78 t/s` |
 | Dropped partial active sidecar, `ACTIVE_REPACK_MAX_EXPERTS=96` | `4249.13 +/- 8.37 t/s` | `126.94 +/- 0.85 t/s` |
 | Dropped bank-ordered NVFP4 row loader | `6447.84 +/- 14.36 t/s` | `126.88 +/- 0.89 t/s` |
+| Dropped record-major canonical NVFP4 loader | `4701.72 +/- 5.28 t/s` | `126.85 +/- 0.86 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -378,6 +379,8 @@ A bank-ordered NVFP4 row-loader experiment kept the same shared-memory layout bu
 A no-fixup stream-k specialization was tested for the common full-tile launch where `fixup_needed == false`. It compiled the hot `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` stack frame down from 64 to 48 bytes, but did not improve runtime: the sampled 8192-block launch regressed from `145.06 us` to `147.87 us`, and the requested benchmark measured `6462.88 +/- 12.57 t/s` pp15000 and `126.94 +/- 0.86 t/s` tg128. The extra template variant was dropped.
 
 The kept block-major loader changes the row staging schedule without changing the shared-memory tile ABI. Instead of a warp staging four rows with eight lanes per row, a warp stages one row and covers four adjacent NVFP4 blocks per phase. Focused CUDA tests passed for `MUL_MAT_NVFP4_NATIVE`, `MUL_MAT_ID type_a=nvfp4`, and dense `MUL_MAT type_a=nvfp4` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64`. The requested benchmark measured `6476.31 +/- 9.50 t/s` pp15000 and `126.93 +/- 0.78 t/s` tg128. Fresh `ncu` on the first 8192-block MoE launch measured `139.81 us`, 128 registers/thread, `28.93 Kbyte/block` dynamic shared memory, 22.95% achieved occupancy, and 0.39 eligible warps/scheduler. Compared with the previous current-load sample, global excessive sectors dropped from `4,685,360 / 10,561,840` to `3,149,360 / 9,025,840`, shared excessive wavefronts stayed at the improved `307,200`, and DRAM bandwidth rose from `559.94 Gbyte/s` to `580.65 Gbyte/s`.
+
+A record-major canonical loader was tested after the block-major pass. It loaded the scale word and eight packed-q words from each 36-byte `block_nvfp4` record together, reducing the separate scale-load pass but requiring three phases per row and extra lane predicates. Correctness passed for focused dense native NVFP4, MoE `MUL_MAT_ID type_a=nvfp4`, and dense repack-cache `MUL_MAT type_a=nvfp4`, but the requested benchmark regressed badly to `4701.72 +/- 5.28 t/s` pp15000 while tg128 stayed flat at `126.85 +/- 0.86 t/s`. The code was dropped; the extra loader phases/control flow dominate any locality benefit.
 
 ## Notes
 
