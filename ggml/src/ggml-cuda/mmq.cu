@@ -468,9 +468,9 @@ void ggml_cuda_mul_mat_q_glu(
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream) {
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, bool src0_repacked_i,
+    const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size, cudaStream_t stream) {
 
     const int64_t ne00 = src0->ne[0];
 
@@ -504,7 +504,7 @@ void ggml_cuda_op_mul_mat_q(
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
         use_stream_k, src1_ncols,
-        false};
+        src0_repacked_i};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

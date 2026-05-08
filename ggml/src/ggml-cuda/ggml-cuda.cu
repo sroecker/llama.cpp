@@ -617,24 +617,28 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+static size_t ggml_cuda_nvfp4_repack_cache_budget_from_env();
+static size_t ggml_cuda_nvfp4_repack_cache_max_tensor_size_from_env();
+static bool ggml_cuda_nvfp4_repack_debug_enabled();
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
     size_t nvfp4_repack_cache_budget = 0;
     size_t nvfp4_repack_cache_used = 0;
+    size_t nvfp4_repack_cache_max_tensor_size = SIZE_MAX;
     std::vector<ggml_cuda_nvfp4_repack_cache *> nvfp4_repack_caches;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
-        const char * env = getenv("GGML_CUDA_NVFP4_REPACK_CACHE_MB");
-        if (env != nullptr && *env != '\0') {
-            char * end = nullptr;
-            const unsigned long long mb = std::strtoull(env, &end, 10);
-            if (end != env) {
-                nvfp4_repack_cache_budget = size_t(mb) * 1024 * 1024;
-            }
+        nvfp4_repack_cache_budget = ggml_cuda_nvfp4_repack_cache_budget_from_env();
+        nvfp4_repack_cache_max_tensor_size = ggml_cuda_nvfp4_repack_cache_max_tensor_size_from_env();
+        if (nvfp4_repack_cache_budget > 0 && ggml_cuda_nvfp4_repack_debug_enabled()) {
+            GGML_LOG_INFO("CUDA NVFP4 repack cache: budget %.2f MiB for %s buffer, max tensor %.2f MiB\n",
+                nvfp4_repack_cache_budget / 1024.0 / 1024.0, name.c_str(),
+                nvfp4_repack_cache_max_tensor_size / 1024.0 / 1024.0);
         }
     }
 
@@ -650,6 +654,39 @@ struct ggml_backend_cuda_buffer_context {
     }
 };
 
+static size_t ggml_cuda_nvfp4_repack_cache_budget_from_env() {
+    const char * env = getenv("GGML_CUDA_NVFP4_REPACK_CACHE_MB");
+    if (env == nullptr || *env == '\0') {
+        return 0;
+    }
+
+    char * end = nullptr;
+    const unsigned long long mb = std::strtoull(env, &end, 10);
+    return end != env ? size_t(mb) * 1024 * 1024 : 0;
+}
+
+static size_t ggml_cuda_nvfp4_repack_cache_max_tensor_size_from_env() {
+    const char * env = getenv("GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB");
+    if (env == nullptr || *env == '\0') {
+        return SIZE_MAX;
+    }
+
+    char * end = nullptr;
+    const unsigned long long mb = std::strtoull(env, &end, 10);
+    return end != env ? size_t(mb) * 1024 * 1024 : SIZE_MAX;
+}
+
+static size_t ggml_cuda_nvfp4_repack_cache_nbytes_from_nblocks(const size_t nblocks) {
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+    constexpr int ints_per_group = MMQ_ITER_K_FP4 / 8 + blocks_per_group;
+
+    if (nblocks % blocks_per_group != 0) {
+        return 0;
+    }
+
+    return (nblocks / blocks_per_group) * (ints_per_group * sizeof(uint32_t));
+}
+
 static size_t ggml_cuda_nvfp4_repack_cache_nbytes(const ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_NVFP4 || tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
         return 0;
@@ -660,14 +697,7 @@ static size_t ggml_cuda_nvfp4_repack_cache_nbytes(const ggml_tensor * tensor) {
     }
 
     const size_t nblocks = ggml_nbytes(tensor) / sizeof(block_nvfp4);
-    if (nblocks % (MMQ_ITER_K_FP4 / QK_NVFP4) != 0) {
-        return 0;
-    }
-
-    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
-    constexpr int ints_per_group = MMQ_ITER_K_FP4 / 8 + blocks_per_group;
-
-    return (nblocks / blocks_per_group) * (ints_per_group * sizeof(uint32_t));
+    return ggml_cuda_nvfp4_repack_cache_nbytes_from_nblocks(nblocks);
 }
 
 static bool ggml_cuda_nvfp4_repack_debug_enabled() {
@@ -711,6 +741,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     const size_t nvfp4_repack_size = ggml_cuda_nvfp4_repack_cache_nbytes(tensor);
     if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             tensor->extra == nullptr && nvfp4_repack_size > 0 && ctx->nvfp4_repack_cache_budget > ctx->nvfp4_repack_cache_used &&
+            nvfp4_repack_size <= ctx->nvfp4_repack_cache_max_tensor_size &&
             nvfp4_repack_size <= ctx->nvfp4_repack_cache_budget - ctx->nvfp4_repack_cache_used) {
         ggml_cuda_set_device(ctx->device);
 
@@ -981,6 +1012,21 @@ struct ggml_backend_cuda_split_buffer_type_context {
 };
 
 struct ggml_backend_cuda_split_buffer_context {
+    size_t nvfp4_repack_cache_budget = 0;
+    size_t nvfp4_repack_cache_used = 0;
+    size_t nvfp4_repack_cache_max_tensor_size = SIZE_MAX;
+    std::vector<ggml_cuda_nvfp4_repack_cache *> nvfp4_repack_caches;
+
+    ggml_backend_cuda_split_buffer_context() {
+        nvfp4_repack_cache_budget = ggml_cuda_nvfp4_repack_cache_budget_from_env();
+        nvfp4_repack_cache_max_tensor_size = ggml_cuda_nvfp4_repack_cache_max_tensor_size_from_env();
+        if (nvfp4_repack_cache_budget > 0 && ggml_cuda_nvfp4_repack_debug_enabled()) {
+            GGML_LOG_INFO("CUDA NVFP4 repack cache: budget %.2f MiB for split buffer, max tensor %.2f MiB\n",
+                nvfp4_repack_cache_budget / 1024.0 / 1024.0,
+                nvfp4_repack_cache_max_tensor_size / 1024.0 / 1024.0);
+        }
+    }
+
     ~ggml_backend_cuda_split_buffer_context() {
         for (ggml_tensor_extra_gpu * extra : tensor_extras) {
             for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
@@ -994,6 +1040,12 @@ struct ggml_backend_cuda_split_buffer_context {
                 }
             }
             delete extra;
+        }
+        for (ggml_cuda_nvfp4_repack_cache * cache : nvfp4_repack_caches) {
+            if (cache->data != nullptr) {
+                CUDA_CHECK(cudaFree(cache->data));
+            }
+            delete cache;
         }
     }
 
@@ -1055,6 +1107,37 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
 
         extra->data_device[id] = buf;
 
+        const size_t nvfp4_repack_size =
+            tensor->type == GGML_TYPE_NVFP4 && ne0 % MMQ_ITER_K_FP4 == 0 ?
+                ggml_cuda_nvfp4_repack_cache_nbytes_from_nblocks(original_size / sizeof(block_nvfp4)) : 0;
+        if (nvfp4_repack_size > 0 && ctx->nvfp4_repack_cache_budget > ctx->nvfp4_repack_cache_used &&
+                nvfp4_repack_size <= ctx->nvfp4_repack_cache_max_tensor_size &&
+                nvfp4_repack_size <= ctx->nvfp4_repack_cache_budget - ctx->nvfp4_repack_cache_used) {
+            void * cache_data = nullptr;
+            cudaError_t err = ggml_cuda_device_malloc(&cache_data, nvfp4_repack_size, id);
+            if (err == cudaSuccess) {
+                ggml_cuda_nvfp4_repack_cache * cache = new ggml_cuda_nvfp4_repack_cache{};
+                cache->data = cache_data;
+                cache->size = nvfp4_repack_size;
+                extra->nvfp4_repack_cache[id] = cache;
+                ctx->nvfp4_repack_caches.push_back(cache);
+                ctx->nvfp4_repack_cache_used += nvfp4_repack_size;
+
+                if (ggml_cuda_nvfp4_repack_debug_enabled()) {
+                    GGML_LOG_INFO("CUDA NVFP4 repack cache: reserved %.2f MiB for split %s on device %d (used %.2f / %.2f MiB)\n",
+                        nvfp4_repack_size / 1024.0 / 1024.0, tensor->name, id,
+                        ctx->nvfp4_repack_cache_used / 1024.0 / 1024.0,
+                        ctx->nvfp4_repack_cache_budget / 1024.0 / 1024.0);
+                }
+            } else {
+                (void) cudaGetLastError();
+                if (ggml_cuda_nvfp4_repack_debug_enabled()) {
+                    GGML_LOG_WARN("CUDA NVFP4 repack cache: allocation of %.2f MiB failed for split %s on device %d: %s\n",
+                        nvfp4_repack_size / 1024.0 / 1024.0, tensor->name, id, cudaGetErrorString(err));
+                }
+            }
+        }
+
         for (int64_t is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
             CUDA_CHECK(cudaEventCreateWithFlags(&extra->events[id][is], cudaEventDisableTiming));
         }
@@ -1094,7 +1177,16 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
         }
 
         const char * buf_host = (const char *)data + offset_split;
+        ggml_cuda_set_device(id);
         CUDA_CHECK(cudaMemcpyAsync(extra->data_device[id], buf_host, original_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+        ggml_cuda_nvfp4_repack_cache * cache = extra->nvfp4_repack_cache[id];
+        if (cache != nullptr) {
+            const int64_t nblocks = original_size / sizeof(block_nvfp4);
+            ggml_cuda_nvfp4_repack_mmq_cuda((const char *) extra->data_device[id], cache->data, nblocks, cudaStreamPerThread);
+            CUDA_CHECK(cudaGetLastError());
+            cache->ready = true;
+        }
     }
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
@@ -1489,9 +1581,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
     ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream);
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, bool src0_repacked_i,
+    const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size, cudaStream_t stream);
 
 #ifndef GGML_CUDA_PEER_MAX_BATCH_SIZE
 #define GGML_CUDA_PEER_MAX_BATCH_SIZE 128
@@ -1564,9 +1656,9 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
 
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream) {
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, bool src0_repacked_i,
+    const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size, cudaStream_t stream) {
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -1716,7 +1808,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                     &beta,  dst_dd_i,    ldc));
     }
 
-    GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
+    GGML_UNUSED_VARS(dst, src0_repacked_i, src1_ddq_i, src1_padded_row_size);
 }
 
 static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
@@ -1817,6 +1909,7 @@ static void ggml_cuda_op_mul_mat(
 
         int64_t  row_low;
         int64_t row_high;
+        bool src0_repacked = false;
     };
 
     dev_data dev[GGML_CUDA_MAX_DEVICES];
@@ -1866,6 +1959,21 @@ static void ggml_cuda_op_mul_mat(
 
         if (src0_is_contiguous) {
             dev[id].src0_dd = split ? (char *) src0_extra->data_device[id] : (char *) src0->data;
+            if (split && src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(dev[id].cc)) {
+                ggml_cuda_nvfp4_repack_cache * cache = src0_extra->nvfp4_repack_cache[id];
+                if (cache != nullptr && cache->ready) {
+                    dev[id].src0_dd = (char *) cache->data;
+                    dev[id].src0_repacked = true;
+
+                    if (ggml_cuda_nvfp4_repack_debug_enabled()) {
+                        static bool logged = false;
+                        if (!logged) {
+                            GGML_LOG_INFO("CUDA NVFP4 repack cache: using split-buffer MMQ sidecar weights\n");
+                            logged = true;
+                        }
+                    }
+                }
+            }
         } else {
             // If src0 is not contiguous it will be copied to a temporary buffer.
             // This buffer needs to be cleared entirely because multiple regions will function as padding.
@@ -2008,7 +2116,7 @@ static void ggml_cuda_op_mul_mat(
                 }
 
                 // do the computation
-                op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
+                op(ctx, src0, src1, dst, src0_dd_i, dev[id].src0_repacked, src1_ddf_i, src1_ddq_i, dst_dd_i,
                     dev[id].row_low, dev[id].row_high, src1_ncols, src1_padded_col_size, stream);
                 CUDA_CHECK(cudaGetLastError());
 

@@ -2,7 +2,7 @@
 
 Date: 2026-05-08
 
-Branch: `feature/native-nvfp4-repack-cache-local`
+Branch: `feature/native-nvfp4-shmem-accounting-local`
 
 Target GPU: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, 16 GB class VRAM.
 
@@ -19,7 +19,8 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - Host shared-memory launch sizing now uses the Blackwell FP4 X-tile stride for NVFP4, matching the actual device-side native FP4 loader layout instead of the larger generic NVFP4 fallback stride.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
-- An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
+- An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
+- `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -107,11 +108,15 @@ Benchmark command:
 | SM120 NVFP4 MMQ 4-warp Y64 3-CTA launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
 | SM120 NVFP4 MMQ 4-warp Y64 4-CTA launch-bound hint | `6433.62 +/- 8.94 t/s` | `127.00 +/- 0.67 t/s` |
 | SM120 NVFP4 lane-remapped weight loader | `6480.10 +/- 6.03 t/s` | `127.06 +/- 0.66 t/s` |
-| Current source, repack cache disabled | `6470.57 +/- 3.89 t/s` | `126.91 +/- 0.89 t/s` |
-| `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6479.81 +/- 17.12 t/s` | `126.96 +/- 0.92 t/s` |
-| `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6469.15 +/- 14.25 t/s` | `126.89 +/- 0.95 t/s` |
 | Blackwell FP4 shared-size accounting fix | `6469.39 +/- 7.31 t/s` | `126.79 +/- 0.84 t/s` |
 | Shared-size fix + `GGML_CUDA_NVFP4_MMQ_X_MAX=32` | `6103.98 +/- 13.44 t/s` | `126.71 +/- 0.92 t/s` |
+| Split-buffer repack support, cache disabled | `6477.44 +/- 3.29 t/s` | `126.98 +/- 0.84 t/s` |
+| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6488.39 +/- 9.84 t/s` | `126.95 +/- 0.92 t/s` |
+| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=128` | `6495.67 +/- 6.33 t/s` | `126.99 +/- 0.89 t/s` |
+| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6480.65 +/- 12.12 t/s` | `126.77 +/- 0.82 t/s` |
+| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=512` | `6488.43 +/- 10.35 t/s` | `126.82 +/- 0.78 t/s` |
+| Split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=16` | `6493.59 +/- 7.20 t/s` | `126.96 +/- 0.90 t/s` |
+| Split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=32` | `6489.24 +/- 3.86 t/s` | `126.86 +/- 0.84 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -294,9 +299,15 @@ The first opt-in repack-cache prototype passed correctness but did not produce a
 
 `ncu` on the cached specialization reported 128 registers/thread and 30.98 KiB dynamic shared memory/block, matching the current uncached specialization's resource shape. The sampled cached launch had only a 70-block grid, so achieved occupancy was low (`8.32%`) due to underfilled work rather than a new resource cliff. Because the r3 benchmark is within noise at 64 MiB and slightly worse at 256 MiB, the cache stays opt-in rather than becoming the default.
 
+The split-buffer cache follow-up wires the same sidecar through `ggml_tensor_extra_gpu` so tensor-split CUDA model weights can use `x_repacked=true` too. `ncu` confirmed the real benchmark now launches `mul_mat_q<NVFP4,64,apply_scale,x_repacked=true>`. A 128 MiB cache is the best local result so far, but the gain is still small (`6495.67 +/- 6.33 t/s` versus `6477.44 +/- 3.29 t/s` without cache). `nsys` with 128 MiB still shows uncached NVFP4 MMQ at `25.1%` of CUDA kernel time and cached NVFP4 MMQ at only `1.4%`, so the cache remains coverage-limited.
+
+The optional `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` admission cap was tested to skip the 75 MiB all-expert tensors in this GGUF and bias the cache toward smaller attention/shared-expert weights. Caps of 16 MiB and 32 MiB did not beat the uncapped 128 MiB run, so no default cap is applied.
+
 The shared-memory follow-up found a host/device accounting mismatch: host launch sizing used the generic NVFP4 MMA tile stride (`84` int words/row), while the Blackwell native FP4 loader uses the FP4 stride (`76` int words/row). Correcting the host launch size dropped sampled dynamic shared memory from `30.98 Kbyte/block` to `28.93 Kbyte/block`; registers stayed at 128/thread, theoretical occupancy stayed at `25%`, and shared memory still limited the hot `mul_mat_q<NVFP4,64,apply_scale>` specialization to three CTAs/SM.
 
 A 48-row, 3-warp NVFP4 tile was tested and dropped. It satisfies `nwarps * tile_C::I == mmq_y`, but it violates the `ntx=2` row-pairing requirement used when `mmq_x >= 48`; focused NVFP4 tests caught an illegal memory access. A safer `MMQ_X_MAX=32` sweep can fit under the 4-CTA shared-memory threshold with the corrected accounting, but it regressed pp15000 to `6103.98 +/- 13.44 t/s`, so the default stays at `MMQ_X_MAX=64`.
+
+A 32-row, 2-warp NVFP4 tile was tested next and also dropped. The naive version reduced dynamic shared memory to `19.20 Kbyte/block`, but the looser launch bound let the compiler allocate 255 registers/thread, capping theoretical occupancy at `16.67%` and regressing pp15000 to `5850.18 +/- 8.83 t/s`. Tightening the launch-bound hint to 8 CTAs restored 128 registers/thread and raised achieved occupancy to `18.99%`, but pp15000 only recovered to `6151.02 +/- 7.14 t/s`. The 4-warp Y64 tile remains better because it keeps 12 theoretical active warps/SM with the same 128-register allocation.
 
 ## Notes
 

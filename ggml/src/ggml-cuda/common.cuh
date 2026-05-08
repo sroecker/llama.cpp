@@ -1168,11 +1168,6 @@ struct ggml_cuda_pool_alloc {
 
 // backend interface
 
-struct ggml_tensor_extra_gpu {
-    void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
-    cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
-};
-
 static constexpr uint32_t GGML_CUDA_NVFP4_REPACK_CACHE_MAGIC = 0x4E563450u; // "NV4P"
 
 struct ggml_cuda_nvfp4_repack_cache {
@@ -1180,6 +1175,12 @@ struct ggml_cuda_nvfp4_repack_cache {
     void * data = nullptr;
     size_t size = 0;
     bool ready = false;
+};
+
+struct ggml_tensor_extra_gpu {
+    void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
+    cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
+    ggml_cuda_nvfp4_repack_cache * nvfp4_repack_cache[GGML_CUDA_MAX_DEVICES]; // optional split-buffer sidecars
 };
 
 static inline ggml_cuda_nvfp4_repack_cache * ggml_cuda_nvfp4_get_repack_cache(const ggml_tensor * tensor) {
