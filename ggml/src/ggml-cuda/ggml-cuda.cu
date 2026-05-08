@@ -2382,6 +2382,62 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_nvfp4_mmq_glu_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_NVFP4_MMQ_GLU");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_should_fuse_mul_mat_q_glu(const ggml_tensor * tensor, const ggml_cuda_mm_fusion_args_host & fusion) {
+    if (!ggml_cuda_nvfp4_mmq_glu_enabled()) {
+        return false;
+    }
+
+    if (tensor->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    if (fusion.x_bias || fusion.gate_bias || !fusion.gate) {
+        return false;
+    }
+
+    ggml_tensor *       src0 = tensor->src[0];
+    ggml_tensor *       src1 = tensor->src[1];
+    const ggml_tensor * dst  = tensor;
+
+    if (src0->type != GGML_TYPE_NVFP4 || fusion.gate->type != GGML_TYPE_NVFP4 ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if ((fusion.x_scale    && (fusion.x_scale->type    != GGML_TYPE_F32 || fusion.x_scale->ne[0]    != src0->ne[2])) ||
+        (fusion.gate_scale && (fusion.gate_scale->type != GGML_TYPE_F32 || fusion.gate_scale->ne[0] != src0->ne[2]))) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!blackwell_mma_available(cc)) {
+        return false;
+    }
+
+    if (dst->ne[2] != 1) {
+        return false;
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(src1->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(fusion.gate->buffer->buft) ||
+                       (fusion.x_scale    && ggml_backend_buft_is_cuda_split(fusion.x_scale->buffer->buft)) ||
+                       (fusion.gate_scale && ggml_backend_buft_is_cuda_split(fusion.gate_scale->buffer->buft));
+    if (split) {
+        return false;
+    }
+
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -3668,6 +3724,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+struct ggml_cuda_scaled_mul_mat_id {
+    ggml_tensor * mm = nullptr;
+    ggml_tensor * scale = nullptr;
+};
+
+static bool ggml_cuda_extract_scaled_mul_mat_id(ggml_tensor * mul, ggml_cuda_scaled_mul_mat_id & result) {
+    if (mul->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    ggml_tensor * mm       = nullptr;
+    ggml_tensor * get_rows = nullptr;
+
+    if (mul->src[0] && mul->src[0]->op == GGML_OP_MUL_MAT_ID && mul->src[1] && mul->src[1]->op == GGML_OP_GET_ROWS) {
+        mm       = mul->src[0];
+        get_rows = mul->src[1];
+    } else if (mul->src[1] && mul->src[1]->op == GGML_OP_MUL_MAT_ID && mul->src[0] && mul->src[0]->op == GGML_OP_GET_ROWS) {
+        mm       = mul->src[1];
+        get_rows = mul->src[0];
+    } else {
+        return false;
+    }
+
+    if (!mm->src[0] || !mm->src[1] || !mm->src[2] || get_rows->src[1] != mm->src[2]) {
+        return false;
+    }
+
+    ggml_tensor * repeat = get_rows->src[0];
+    if (!repeat || repeat->op != GGML_OP_REPEAT || !repeat->src[0] || repeat->src[0]->op != GGML_OP_RESHAPE) {
+        return false;
+    }
+
+    ggml_tensor * scale = repeat->src[0]->src[0];
+    if (!scale || scale->type != GGML_TYPE_F32 || scale->ne[0] != mm->src[0]->ne[2]) {
+        return false;
+    }
+
+    result.mm    = mm;
+    result.scale = scale;
+    return true;
+}
+
+static bool ggml_cuda_can_fuse_scaled_mul_mat_id_glu(const ggml_cgraph * cgraph, const int i) {
+    const ggml_op ops[] = {
+        GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
+        GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL,
+        GGML_OP_GLU,
+    };
+    if (i + 11 > cgraph->n_nodes) {
+        return false;
+    }
+
+    bool ops_match = true;
+    bool uses_ok   = true;
+    for (int j = 0; j < 11; ++j) {
+        const ggml_tensor * node = cgraph->nodes[i + j];
+        if (node->op != ops[j]) {
+            ops_match = false;
+            break;
+        }
+        if (j < 10) {
+            uses_ok = uses_ok && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + j) == 1;
+        }
+    }
+
+    int out_nodes[] = { i + 10 };
+    return ops_match && uses_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 11, out_nodes, 1);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3876,6 +4001,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 5;
                 break;
             }
+        } else if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_can_fuse_scaled_mul_mat_id_glu(cgraph, i)) {
+            ggml_tensor * glu = cgraph->nodes[i + 10];
+            GGML_ASSERT(glu->op == GGML_OP_GLU);
+
+            ggml_cuda_scaled_mul_mat_id gate_info;
+            ggml_cuda_scaled_mul_mat_id up_info;
+            if (!ggml_cuda_extract_scaled_mul_mat_id(glu->src[0], gate_info) ||
+                    !ggml_cuda_extract_scaled_mul_mat_id(glu->src[1], up_info)) {
+                continue;
+            }
+
+            if (gate_info.mm->src[1] != up_info.mm->src[1] || gate_info.mm->src[2] != up_info.mm->src[2]) {
+                continue;
+            }
+
+            const ggml_tensor * src0 = up_info.mm->src[0];
+            const ggml_tensor * src1 = up_info.mm->src[1];
+            const ggml_tensor * ids  = up_info.mm->src[2];
+
+            const bool should_mmvq = ggml_cuda_should_fuse_mul_mat_vec_q(up_info.mm);
+            if (should_mmvq) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate       = gate_info.mm->src[0];
+                fusion_data.x_scale    = up_info.scale;
+                fusion_data.gate_scale = gate_info.scale;
+                fusion_data.glu_op     = ggml_get_glu_op(glu);
+
+                if (ggml_cuda_should_fuse_mul_mat_q_glu(up_info.mm, fusion_data)) {
+                    ggml_cuda_mul_mat_q_glu(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 11;
+                    break;
+                }
+            }
         } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
             ggml_tensor * glu  = cgraph->nodes[i + 2];
             ggml_tensor * gate = glu->src[0];
@@ -3907,6 +4066,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
+
+                if (ggml_cuda_should_fuse_mul_mat_q_glu(up, fusion_data)) {
+                    ggml_cuda_mul_mat_q_glu(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 3;
+                    break;
+                }
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;

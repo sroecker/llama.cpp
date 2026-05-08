@@ -66,7 +66,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4
+    MMVQ_PARAMETERS_RDNA4,
+    MMVQ_PARAMETERS_BLACKWELL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -78,12 +79,17 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
+#elif defined(BLACKWELL_MMA_AVAILABLE)
+    return MMVQ_PARAMETERS_BLACKWELL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
 }
 
 static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+    if (blackwell_mma_available(cc)) {
+        return MMVQ_PARAMETERS_BLACKWELL;
+    }
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
     }
@@ -368,11 +374,29 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return 1;
     }
+    if (table_id == MMVQ_PARAMETERS_BLACKWELL) {
+        if (ncols_dst == 1) {
+            return 2;
+        }
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+                return 4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_BLACKWELL) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;

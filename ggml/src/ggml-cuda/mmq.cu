@@ -74,6 +74,22 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+static size_t ggml_cuda_mmq_src1_nbytes(
+        const ggml_type type_x, const int cc, const int64_t nrows, const int64_t ncols_padded, const bool use_native_fp4) {
+    const size_t row_size = use_native_fp4
+        ? ncols_padded * sizeof(block_fp4_mmq) / QK_K
+        : ncols_padded * sizeof(block_q8_1)    / QK8_1;
+
+    return nrows * row_size + get_mmq_x_max_for_type(type_x, cc) * sizeof(block_q8_1_mmq);
+}
+
+static int64_t ggml_cuda_mmq_src1_stride(
+        const int64_t nrows, const int64_t ncols_padded, const bool use_native_fp4) {
+    return use_native_fp4
+        ? nrows * ncols_padded * sizeof(block_fp4_mmq) / (QK_K  * sizeof(int))
+        : nrows * ncols_padded * sizeof(block_q8_1)    / (QK8_1 * sizeof(int));
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -121,12 +137,11 @@ void ggml_cuda_mul_mat_q(
     const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);
 
-    // TODO: tighter pool buffer size vs q8 path
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-            get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(
+            src0->type, cc, ne13*ne12*ne11, ne10_padded, use_native_fp4);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
         {
@@ -145,10 +160,7 @@ void ggml_cuda_mul_mat_q(
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int)) :  // block_fp4_mmq holds 256 values
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const int64_t s12 = ggml_cuda_mmq_src1_stride(ne11, ne10_padded, use_native_fp4);
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
@@ -183,8 +195,8 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(
+        src0->type, cc, ne12*n_expert_used, ne10_padded, use_native_fp4);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
     const int64_t ne11_flat = ne12*n_expert_used;
@@ -206,9 +218,7 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    static_assert(QK_K == 8 * QK_MXFP4, "QK_K needs to be 8 * QK_MXFP4");
-    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int)) :
-                                         ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s12 = ggml_cuda_mmq_src1_stride(ne11, ne10_padded, use_native_fp4);
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
@@ -220,6 +230,112 @@ void ggml_cuda_mul_mat_q(
         use_stream_k, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+void ggml_cuda_mul_mat_q_glu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    GGML_ASSERT(src0->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(fusion && fusion->gate);
+    GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias);
+    GGML_ASSERT(fusion->gate->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(!fusion->x_scale || fusion->x_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(!fusion->gate_scale || fusion->gate_scale->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    GGML_ASSERT(blackwell_mma_available(cc));
+
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: using experimental NVFP4 MMQ+GLU path\n", __func__);
+        logged = true;
+    }
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00       == ts_src0);
+    GGML_ASSERT(nb10       == ts_src1);
+    GGML_ASSERT(nb0        == ts_dst);
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+
+    const char  * src0_d = (const char  *) src0->data;
+    const char  * gate_d = (const char  *) fusion->gate->data;
+    const float * x_scale_d    = fusion->x_scale    ? (const float *) fusion->x_scale->data    : nullptr;
+    const float * gate_scale_d = fusion->gate_scale ? (const float *) fusion->gate_scale->data : nullptr;
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1  =  dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  =  dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    GGML_ASSERT(ne13 == 1);
+    GGML_ASSERT(nb12 % nb11 == 0);
+    GGML_ASSERT(nb2  % nb1  == 0);
+    GGML_ASSERT(!fusion->x_scale    || fusion->x_scale->ne[0]    == ne02);
+    GGML_ASSERT(!fusion->gate_scale || fusion->gate_scale->ne[0] == ne02);
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
+    GGML_ASSERT(ne1 == n_expert_used);
+    GGML_ASSERT(ne12 == 1);
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+
+    {
+        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+        const int si1  = ids->nb[1] / ggml_element_size(ids);
+        const int sis1 = nb12 / nb11;
+
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const size_t nbytes_src1_fp4 =
+        ne12*n_expert_used*ne10_padded * sizeof(block_fp4_mmq)/QK_K +
+        8*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_fp4(ctx.pool(), nbytes_src1_fp4);
+
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+
+        quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_fp4.get(), src0->type, ne10, s11, s12, s13,
+                              ne10_padded, ne_get_rows, 1, 1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    static_assert(QK_K == 8 * QK_MXFP4, "QK_K needs to be 8 * QK_MXFP4");
+    const int64_t s12 = ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int));
+    const int64_t s13 = ne12 * s12;
+
+    const mmq_glu_args args = {
+        src0_d, gate_d, x_scale_d, gate_scale_d,
+        (const int *) src1_fp4.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne02, ne02, s02, s12, s2,
+        ne03, ne13, s03, s13, s3,
+        ne12, fusion->glu_op};
+
+    launch_mul_mat_q_glu_nvfp4<8>(ctx, args, stream);
 }
 
 void ggml_cuda_op_mul_mat_q(
