@@ -2,7 +2,7 @@
 
 Date: 2026-05-08
 
-Branch: `feature/native-nvfp4-scale-semantics-local`
+Branch: `feature/native-nvfp4-repack-cache-local`
 
 Target GPU: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, 16 GB class VRAM.
 
@@ -17,6 +17,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti memory pressure reduction by sizing native FP4 activation scratch as FP4 blocks instead of Q8 blocks.
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
+- Host shared-memory launch sizing now uses the Blackwell FP4 X-tile stride for NVFP4, matching the actual device-side native FP4 loader layout instead of the larger generic NVFP4 fallback stride.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
@@ -109,6 +110,8 @@ Benchmark command:
 | Current source, repack cache disabled | `6470.57 +/- 3.89 t/s` | `126.91 +/- 0.89 t/s` |
 | `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6479.81 +/- 17.12 t/s` | `126.96 +/- 0.92 t/s` |
 | `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6469.15 +/- 14.25 t/s` | `126.89 +/- 0.95 t/s` |
+| Blackwell FP4 shared-size accounting fix | `6469.39 +/- 7.31 t/s` | `126.79 +/- 0.84 t/s` |
+| Shared-size fix + `GGML_CUDA_NVFP4_MMQ_X_MAX=32` | `6103.98 +/- 13.44 t/s` | `126.71 +/- 0.92 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -291,10 +294,15 @@ The first opt-in repack-cache prototype passed correctness but did not produce a
 
 `ncu` on the cached specialization reported 128 registers/thread and 30.98 KiB dynamic shared memory/block, matching the current uncached specialization's resource shape. The sampled cached launch had only a 70-block grid, so achieved occupancy was low (`8.32%`) due to underfilled work rather than a new resource cliff. Because the r3 benchmark is within noise at 64 MiB and slightly worse at 256 MiB, the cache stays opt-in rather than becoming the default.
 
+The shared-memory follow-up found a host/device accounting mismatch: host launch sizing used the generic NVFP4 MMA tile stride (`84` int words/row), while the Blackwell native FP4 loader uses the FP4 stride (`76` int words/row). Correcting the host launch size dropped sampled dynamic shared memory from `30.98 Kbyte/block` to `28.93 Kbyte/block`; registers stayed at 128/thread, theoretical occupancy stayed at `25%`, and shared memory still limited the hot `mul_mat_q<NVFP4,64,apply_scale>` specialization to three CTAs/SM.
+
+A 48-row, 3-warp NVFP4 tile was tested and dropped. It satisfies `nwarps * tile_C::I == mmq_y`, but it violates the `ntx=2` row-pairing requirement used when `mmq_x >= 48`; focused NVFP4 tests caught an illegal memory access. A safer `MMQ_X_MAX=32` sweep can fit under the 4-CTA shared-memory threshold with the corrected accounting, but it regressed pp15000 to `6103.98 +/- 13.44 t/s`, so the default stays at `MMQ_X_MAX=64`.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
 - `llama-cli -st --reasoning off` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed `Paris is the capital of` as `Paris is the capital of **France**.`
+- `llama-cli -st --reasoning off` after the shared-size accounting fix completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-completion -no-cnv` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed the raw prompt with `France`.
 - The first `.scale` epilogue fusion draft applied to decode-sized workloads too and dropped `tg128` to about `107 t/s`; the current version mirrors normal dispatch and only fuses cases that should use MMQ rather than MMVQ.
 - The first priority for the 5070 Ti is keeping the native path within the 16 GB memory envelope while preserving correctness.

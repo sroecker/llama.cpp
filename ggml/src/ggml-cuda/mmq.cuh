@@ -4426,7 +4426,12 @@ static void launch_mul_mat_q_glu_nvfp4(ggml_backend_cuda_context & ctx, const mm
 template<ggml_type type>
 static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
-    const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        if (blackwell_mma_available(cc)) {
+            mmq_tile_x_k = MMQ_MMA_TILE_X_K_FP4;
+        }
+    }
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
