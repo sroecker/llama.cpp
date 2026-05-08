@@ -19,7 +19,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - Host shared-memory launch sizing now uses the Blackwell FP4 X-tile stride for NVFP4, matching the actual device-side native FP4 loader layout instead of the larger generic NVFP4 fallback stride.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
-- An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
+- An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset. Split-buffer sidecars are gated off until split native FP4 activation quantization is wired.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
@@ -52,6 +52,8 @@ GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CU
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_INPUT_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_INPUT_SCALE -b CUDA0
+GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_NVFP4_NATIVE -b CUDA0
+GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops perf -o MUL_MAT_NVFP4_NATIVE -b CUDA0
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
 ```
 
@@ -64,6 +66,8 @@ Results:
 - `MUL_MAT_ID_SCALE`: 2/2 passed.
 - `MUL_MAT_INPUT_SCALE`: 1/1 passed.
 - `MUL_MAT_ID_INPUT_SCALE`: 1/1 passed.
+- `MUL_MAT_NVFP4_NATIVE`: 2/2 passed. This is a focused dense native-MMQ scale harness covering combined activation `input_scale` and output `.scale` on k=256 and k=1024 cases.
+- `MUL_MAT_NVFP4_NATIVE` perf smoke: `4096x128x4096` ran at `4.62 us/run`, `929.20 TFLOP/s`; `4096x512x4096` ran at `27.85 us/run`, `616.82 TFLOP/s`.
 - Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
 - Debug input-scale smoke: dense and `MUL_MAT_ID` input-scale tests both logged activation `input_scale` consumption in the MMQ quantizer.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` `MUL_MAT type_a=nvfp4`: 41/41 passed, with the debug log confirming that the sidecar MMQ weight loader was selected on eligible k=1024 cases.
@@ -110,13 +114,14 @@ Benchmark command:
 | SM120 NVFP4 lane-remapped weight loader | `6480.10 +/- 6.03 t/s` | `127.06 +/- 0.66 t/s` |
 | Blackwell FP4 shared-size accounting fix | `6469.39 +/- 7.31 t/s` | `126.79 +/- 0.84 t/s` |
 | Shared-size fix + `GGML_CUDA_NVFP4_MMQ_X_MAX=32` | `6103.98 +/- 13.44 t/s` | `126.71 +/- 0.92 t/s` |
-| Split-buffer repack support, cache disabled | `6477.44 +/- 3.29 t/s` | `126.98 +/- 0.84 t/s` |
-| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6488.39 +/- 9.84 t/s` | `126.95 +/- 0.92 t/s` |
-| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=128` | `6495.67 +/- 6.33 t/s` | `126.99 +/- 0.89 t/s` |
-| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6480.65 +/- 12.12 t/s` | `126.77 +/- 0.82 t/s` |
-| Split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=512` | `6488.43 +/- 10.35 t/s` | `126.82 +/- 0.78 t/s` |
-| Split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=16` | `6493.59 +/- 7.20 t/s` | `126.96 +/- 0.90 t/s` |
-| Split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=32` | `6489.24 +/- 3.86 t/s` | `126.86 +/- 0.84 t/s` |
+| Experimental split-buffer repack pass, cache disabled | `6477.44 +/- 3.29 t/s` | `126.98 +/- 0.84 t/s` |
+| Experimental split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6488.39 +/- 9.84 t/s` | `126.95 +/- 0.92 t/s` |
+| Experimental split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=128` | `6495.67 +/- 6.33 t/s` | `126.99 +/- 0.89 t/s` |
+| Experimental split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6480.65 +/- 12.12 t/s` | `126.77 +/- 0.82 t/s` |
+| Experimental split-buffer repack, `GGML_CUDA_NVFP4_REPACK_CACHE_MB=512` | `6488.43 +/- 10.35 t/s` | `126.82 +/- 0.78 t/s` |
+| Experimental split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=16` | `6493.59 +/- 7.20 t/s` | `126.96 +/- 0.90 t/s` |
+| Experimental split-buffer repack, `CACHE_MB=128`, `MAX_TENSOR_MB=32` | `6489.24 +/- 3.86 t/s` | `126.86 +/- 0.84 t/s` |
+| Split sidecar gated off + `CACHE_MB=128` sanity, `-r 1` | `6511.15 +/- 0.00 t/s` | `126.08 +/- 0.00 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -299,7 +304,7 @@ The first opt-in repack-cache prototype passed correctness but did not produce a
 
 `ncu` on the cached specialization reported 128 registers/thread and 30.98 KiB dynamic shared memory/block, matching the current uncached specialization's resource shape. The sampled cached launch had only a 70-block grid, so achieved occupancy was low (`8.32%`) due to underfilled work rather than a new resource cliff. Because the r3 benchmark is within noise at 64 MiB and slightly worse at 256 MiB, the cache stays opt-in rather than becoming the default.
 
-The split-buffer cache follow-up wires the same sidecar through `ggml_tensor_extra_gpu` so tensor-split CUDA model weights can use `x_repacked=true` too. `ncu` confirmed the real benchmark now launches `mul_mat_q<NVFP4,64,apply_scale,x_repacked=true>`. A 128 MiB cache is the best local result so far, but the gain is still small (`6495.67 +/- 6.33 t/s` versus `6477.44 +/- 3.29 t/s` without cache). `nsys` with 128 MiB still shows uncached NVFP4 MMQ at `25.1%` of CUDA kernel time and cached NVFP4 MMQ at only `1.4%`, so the cache remains coverage-limited.
+The split-buffer cache follow-up briefly wired the same sidecar through `ggml_tensor_extra_gpu`, but review found that the generic split `MUL_MAT` path still quantizes `src1` with the q8_1 MMQ path. That is incompatible with launching the native FP4 `x_repacked=true` MMQ specialization, which expects FP4 activation blocks. Split-buffer sidecars are therefore gated off again until the split path can use `quantize_mmq_fp4_cuda`; the measured 128 MiB cache result remains useful as an experiment, not as a kept default path.
 
 The optional `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` admission cap was tested to skip the 75 MiB all-expert tensors in this GGUF and bias the cache toward smaller attention/shared-expert weights. Caps of 16 MiB and 32 MiB did not beat the uncapped 128 MiB run, so no default cap is applied.
 
@@ -312,7 +317,7 @@ A 32-row, 2-warp NVFP4 tile was tested next and also dropped. The naive version 
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
-- `llama-cli -st --reasoning off` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed `Paris is the capital of` as `Paris is the capital of **France**.`
+- `llama-cli -st --reasoning off` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=128` completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-cli -st --reasoning off` after the shared-size accounting fix completed `Paris is the capital of` as `Paris is the capital of **France**.`
 - `llama-completion -no-cnv` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed the raw prompt with `France`.
 - The first `.scale` epilogue fusion draft applied to decode-sized workloads too and dropped `tg128` to about `107 t/s`; the current version mirrors normal dispatch and only fuses cases that should use MMQ rather than MMVQ.

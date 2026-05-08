@@ -705,6 +705,11 @@ static bool ggml_cuda_nvfp4_repack_debug_enabled() {
     return env && std::atoi(env) != 0;
 }
 
+static bool ggml_cuda_nvfp4_repack_split_cache_enabled() {
+    // Split MUL_MAT still prepares q8_1 activations; x_repacked NVFP4 expects FP4 activation blocks.
+    return false;
+}
+
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     delete ctx;
@@ -1024,6 +1029,9 @@ struct ggml_backend_cuda_split_buffer_context {
             GGML_LOG_INFO("CUDA NVFP4 repack cache: budget %.2f MiB for split buffer, max tensor %.2f MiB\n",
                 nvfp4_repack_cache_budget / 1024.0 / 1024.0,
                 nvfp4_repack_cache_max_tensor_size / 1024.0 / 1024.0);
+            if (!ggml_cuda_nvfp4_repack_split_cache_enabled()) {
+                GGML_LOG_INFO("CUDA NVFP4 repack cache: split-buffer sidecars disabled until split native FP4 activation quantization is wired\n");
+            }
         }
     }
 
@@ -1108,7 +1116,7 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
         extra->data_device[id] = buf;
 
         const size_t nvfp4_repack_size =
-            tensor->type == GGML_TYPE_NVFP4 && ne0 % MMQ_ITER_K_FP4 == 0 ?
+            ggml_cuda_nvfp4_repack_split_cache_enabled() && tensor->type == GGML_TYPE_NVFP4 && ne0 % MMQ_ITER_K_FP4 == 0 ?
                 ggml_cuda_nvfp4_repack_cache_nbytes_from_nblocks(original_size / sizeof(block_nvfp4)) : 0;
         if (nvfp4_repack_size > 0 && ctx->nvfp4_repack_cache_budget > ctx->nvfp4_repack_cache_used &&
                 nvfp4_repack_size <= ctx->nvfp4_repack_cache_max_tensor_size &&
@@ -1959,7 +1967,8 @@ static void ggml_cuda_op_mul_mat(
 
         if (src0_is_contiguous) {
             dev[id].src0_dd = split ? (char *) src0_extra->data_device[id] : (char *) src0->data;
-            if (split && src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(dev[id].cc)) {
+            if (split && ggml_cuda_nvfp4_repack_split_cache_enabled() &&
+                    src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(dev[id].cc)) {
                 ggml_cuda_nvfp4_repack_cache * cache = src0_extra->nvfp4_repack_cache[id];
                 if (cache != nullptr && cache->ready) {
                     dev[id].src0_dd = (char *) cache->data;

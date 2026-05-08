@@ -4078,6 +4078,85 @@ struct test_mul_mat_input_scale : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT native NVFP4 harness with optional activation/input and output scales.
+struct test_mul_mat_nvfp4_native : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool output_scale;
+    const bool input_scale;
+
+    std::string vars() override {
+        return VARS_TO_STR5(m, n, k, output_scale, input_scale);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_nvfp4_native(int64_t m = 64, int64_t n = 32, int64_t k = 1024,
+            bool output_scale = true, bool input_scale = true)
+        : m(m), n(n), k(k), output_scale(output_scale), input_scale(input_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(mm, "mm");
+
+        if (input_scale) {
+            ggml_tensor * input_scale_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(input_scale_t, "input_scale");
+            mm->src[3] = input_scale_t;
+        }
+
+        ggml_tensor * out = mm;
+        if (output_scale) {
+            ggml_tensor * output_scale_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(output_scale_t, "output_scale");
+            out = ggml_mul(ctx, mm, output_scale_t);
+        }
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "output_scale") == 0) {
+                init_tensor_uniform(t, 0.75f, 0.75f);
+            } else if (strcmp(t->name, "input_scale") == 0) {
+                init_tensor_uniform(t, 0.625f, 0.625f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_NVFP4_NATIVE";
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -8486,6 +8565,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, false));
     test_cases.emplace_back(new test_mul_mat_scale(GGML_TYPE_NVFP4, 32, 16, 256, true));
     test_cases.emplace_back(new test_mul_mat_input_scale(GGML_TYPE_NVFP4, 32, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_nvfp4_native(32, 16, 256, true, true));
+    test_cases.emplace_back(new test_mul_mat_nvfp4_native(64, 32, 1024, true, true));
 
 #if 0
     // test the mat-mat path for Metal
@@ -9235,6 +9316,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    for (int bs : {128, 512}) {
+        test_cases.emplace_back(new test_mul_mat_nvfp4_native(4096, bs, 4096, true, true));
     }
 
     // qwen3-30b-a3b

@@ -258,6 +258,17 @@ void ggml_cuda_mul_mat_q(
             logged = true;
         }
     }
+    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4 && ggml_cuda_nvfp4_debug_enabled()) {
+        const int mode = (use_repack_cache ? 1 : 0) | (output_scale ? 2 : 0) | (input_scale ? 4 : 0);
+        static bool logged[8] = {};
+        if (!logged[mode]) {
+            GGML_LOG_INFO("CUDA NVFP4 native MMQ dispatch: weights=%s, output_scale=%s, input_scale=%s\n",
+                use_repack_cache ? "repacked" : "canonical",
+                output_scale ? "yes" : "no",
+                input_scale ? "yes" : "no");
+            logged[mode] = true;
+        }
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(
