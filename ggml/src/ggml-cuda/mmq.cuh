@@ -7,6 +7,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace ggml_cuda_mma;
 
@@ -121,6 +122,25 @@ static int get_mmq_stream_k_efficiency_min(const int cc) {
     return blackwell_mma_available(cc) ? 95 : 90;
 }
 
+static int get_nvfp4_mmq_x_max_env() {
+    static const int cap = []() {
+        const char * env = getenv("GGML_CUDA_NVFP4_MMQ_X_MAX");
+        if (!env || !*env) {
+            return 0;
+        }
+
+        const int value = std::atoi(env);
+        if (value <= 0) {
+            return 0;
+        }
+
+        const int rounded = (value / 8) * 8;
+        return rounded < 8 ? 8 : rounded;
+    }();
+
+    return cap;
+}
+
 static int get_mmq_x_max_for_type(const ggml_type type, const int cc) {
     const int mmq_x_max = get_mmq_x_max_host(cc);
 
@@ -134,6 +154,12 @@ static int get_mmq_x_max_for_type(const ggml_type type, const int cc) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
             return mmq_x_max < 64 ? mmq_x_max : 64;
+        case GGML_TYPE_NVFP4: {
+            const int env_cap = get_nvfp4_mmq_x_max_env();
+            const int default_cap = cc == GGML_CUDA_CC_BLACKWELL ? 64 : mmq_x_max;
+            const int cap = env_cap > 0 ? env_cap : default_cap;
+            return cap < mmq_x_max ? cap : mmq_x_max;
+        }
         default:
             return mmq_x_max;
     }
