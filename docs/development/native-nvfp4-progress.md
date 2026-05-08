@@ -17,6 +17,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti memory pressure reduction by sizing native FP4 activation scratch as FP4 blocks instead of Q8 blocks.
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
+- The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -101,6 +102,7 @@ Benchmark command:
 | Source-aligned rerun after profiling | `6244.19 +/- 5.15 t/s` | `127.07 +/- 0.64 t/s` |
 | SM120 NVFP4 MMQ 4-warp Y64 3-CTA launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
 | SM120 NVFP4 MMQ 4-warp Y64 4-CTA launch-bound hint | `6433.62 +/- 8.94 t/s` | `127.00 +/- 0.67 t/s` |
+| SM120 NVFP4 lane-remapped weight loader | `6480.10 +/- 6.03 t/s` | `127.06 +/- 0.66 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -265,6 +267,19 @@ Fresh `ncu` for the 4-CTA hint on `mul_mat_q<NVFP4,64,apply_scale>` showed that 
 | 4-warp Y64 with 4-CTA launch-bound hint | `128` | `30.98 KiB` | `25.00%` | `22.95%` | `11.02` |
 
 The 4-CTA hint did not raise occupancy beyond the 3-CTA result because shared memory is now the limiting resource, but it shortened the sampled 8192-grid MMQ launch from about `157.15 us` to `148.03 us`. The fresh `nsys` trace for the requested benchmark with three repetitions showed `mul_mat_q<NVFP4,64,apply_scale>` at `26.8%` of CUDA kernel time, `gated_delta_net_cuda<128>` at `20.1%`, `flash_attn_ext_f16` at `7.8%`, and `quantize_mmq_nvfp4<0>` at `4.7%`.
+
+The next kept loader pass remapped the 8 row lanes from "one lane owns one `block_nvfp4`" to "one lane owns one 32-bit packed-q word while the row lanes iterate over the 8 blocks together." This does not change the canonical GGUF/GGML storage layout and does not add a repack cache, but it makes each row group load contiguous words from one NVFP4 block at a time and store contiguous words into the existing shared tile layout.
+
+Fresh `ncu` on the same sampled `mul_mat_q<NVFP4,64,apply_scale>` launch showed:
+
+| Loader | Duration | Global-load useful bytes/sector | Global excessive sectors | Shared-store bank conflicts | Achieved occupancy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4-CTA hint baseline | `148.03 us` | `7.0 / 32 B` | `19,738,160 / 25,614,640` | `2.4-way`, `848,500` conflicts | `22.95%` |
+| Lane-remapped loader | `143.33 us` | `17.2 / 32 B` | `4,685,360 / 10,561,840` | `1.6-way`, `798,866` conflicts | `22.87%` |
+
+The active specialization remains resource-stable at 128 registers/thread and 30.98 KiB dynamic shared memory/block. `cuobjdump` reports the no-check/apply-scale specialization stack at `64 B`, down from `72 B` in the previous kept source.
+
+A frag-major MMA staging experiment was also tested to reduce live A/B fragments. It passed the focused NVFP4 tests, but it increased the active no-check/apply-scale stack to `80 B` and regressed the r3 benchmark to `6456.25 +/- 9.05 t/s` pp15000 versus `6475.53 +/- 8.04 t/s` for the kept lane-remapped loader, so that staging change was dropped.
 
 ## Notes
 

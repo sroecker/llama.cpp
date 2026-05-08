@@ -1037,17 +1037,20 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
     constexpr int nwarps = mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int iter_k = get_iter_k(GGML_TYPE_NVFP4);
-    constexpr int threads_per_row = iter_k / QK_NVFP4; // each thread processes 1 block
+    constexpr int blocks_per_row = iter_k / QK_NVFP4;
+    constexpr int words_per_block = QK_NVFP4 / 8;
+    static_assert(blocks_per_row == words_per_block, "NVFP4 MMQ loader assumes one lane per 32-bit q word");
+    constexpr int threads_per_row = blocks_per_row;
     constexpr int rows_per_warp = warp_size / threads_per_row;
 
     uint32_t * x_u32 = (uint32_t *) x_tile;
 
     const int txi = threadIdx.x;
-    const int kbx = txi % threads_per_row;
+    const int word_in_block = txi % threads_per_row;
     const int row_in_warp = txi / threads_per_row;
 
-    const block_nvfp4 * bxi_base = (const block_nvfp4 *) x + kbx0 + kbx;
-    uint32_t * x_u32_scale = x_u32 + 64 + kbx;
+    const block_nvfp4 * bxi_base = (const block_nvfp4 *) x + kbx0;
+    uint32_t * x_u32_scale = x_u32 + 64 + word_in_block;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += rows_per_warp * nwarps) {
@@ -1059,17 +1062,14 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
 
         const block_nvfp4 * bxi = bxi_base + i * stride;
         const int row_base = i * MMQ_MMA_TILE_X_K_FP4;
-        const int q_base = row_base + 8 * kbx;
-
-        const uint32_t * src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
 
 #pragma unroll
-        for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
-            x_u32[q_base + 2 * sub + 0] = src_qs[2 * sub + 0];
-            x_u32[q_base + 2 * sub + 1] = src_qs[2 * sub + 1];
+        for (int kb = 0; kb < blocks_per_row; ++kb) {
+            const uint32_t * src_qs = reinterpret_cast<const uint32_t *>(bxi[kb].qs);
+            x_u32[row_base + 8 * kb + word_in_block] = src_qs[word_in_block];
         }
 
-        x_u32_scale[row_base] = get_int_b4(bxi->d, 0);
+        x_u32_scale[row_base] = get_int_b4(bxi[word_in_block].d, 0);
     }
 }
 
