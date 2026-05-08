@@ -193,6 +193,14 @@ static int get_mmq_y_host(const int cc) {
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
 
+static int get_mmq_y_host_for_type(const ggml_type type, const int cc) {
+    if (type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
+        return 64;
+    }
+
+    return get_mmq_y_host(cc);
+}
+
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
 if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
@@ -216,6 +224,16 @@ static constexpr __device__ int get_mmq_y_device() {
     return 64;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif // defined(GGML_USE_HIP)
+}
+
+static constexpr __device__ int get_mmq_y_device_for_type([[maybe_unused]] const ggml_type type) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (type == GGML_TYPE_NVFP4) {
+        return 64;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
+    return get_mmq_y_device();
 }
 
 // Decouple shared memory tile sizes from WARP_SIZE to allow for different warp sizes.
@@ -353,12 +371,30 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 }
 #endif // (GGML_USE_HIP)
 
+static int mmq_get_nwarps_host_for_type(const ggml_type type, const int cc, const int warp_size) {
+    if (type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
+        return 128/warp_size;
+    }
+
+    return mmq_get_nwarps_host(cc, warp_size);
+}
+
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 8;
 #else
     return 256/ggml_cuda_get_physical_warp_size();
 #endif // AMD_MFMA_AVAILABLE
+}
+
+static constexpr __device__ int mmq_get_nwarps_device_for_type([[maybe_unused]] const ggml_type type) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (type == GGML_TYPE_NVFP4) {
+        return 128/ggml_cuda_get_physical_warp_size();
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
+    return mmq_get_nwarps_device();
 }
 
 // ------------------------------------------------------------
@@ -998,7 +1034,7 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
                                                             const int kbx0,
                                                             const int i_max,
                                                             const int stride) {
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int iter_k = get_iter_k(GGML_TYPE_NVFP4);
     constexpr int threads_per_row = iter_k / QK_NVFP4; // each thread processes 1 block
@@ -1120,7 +1156,7 @@ static __device__ __forceinline__ void load_tiles_nvfp4(const char * __restrict_
                                                         const int kb0,
                                                         const int i_max,
                                                         const int stride) {
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -3282,7 +3318,7 @@ static __device__ __forceinline__ void mmq_write_back_mma(
         const int stride, const int i_max, const int j_max, const float output_scale) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(type);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr int tileC_IJ = mmq_get_granularity_device(0);
@@ -3533,9 +3569,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const float output_scale) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
-    constexpr int              nwarps     = mmq_get_nwarps_device();
+    constexpr int              nwarps     = mmq_get_nwarps_device_for_type(type);
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
-    constexpr int              mmq_y      = get_mmq_y_device();
+    constexpr int              mmq_y      = get_mmq_y_device_for_type(type);
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
@@ -3606,7 +3642,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
-
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale>
@@ -3616,7 +3651,11 @@ template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale>
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for_type(type), type == GGML_TYPE_NVFP4 ? 3 : 1)
+#else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 #else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -3637,11 +3676,11 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr int qk    = ggml_cuda_type_traits<type>::qk;
-    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int mmq_y = get_mmq_y_device_for_type(type);
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
@@ -3876,18 +3915,18 @@ static __global__ void mul_mat_q(
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for_type(type)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
-    constexpr int mmq_y           = get_mmq_y_device();
+    constexpr int mmq_y           = get_mmq_y_device_for_type(type);
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    constexpr int nwarps = mmq_get_nwarps_device()/2;
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(type)/2;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     float sum[mmq_x / nwarps] = {0.0f};
@@ -4106,9 +4145,9 @@ static __device__ __forceinline__ void mul_mat_q_glu_process_tile_nvfp4(
 #if defined(BLACKWELL_MMA_AVAILABLE)
     constexpr ggml_type type = GGML_TYPE_NVFP4;
     constexpr int       warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int       nwarps    = mmq_get_nwarps_device();
+    constexpr int       nwarps    = mmq_get_nwarps_device_for_type(type);
     constexpr int       qk        = ggml_cuda_type_traits<type>::qk;
-    constexpr int       mmq_y     = get_mmq_y_device();
+    constexpr int       mmq_y     = get_mmq_y_device_for_type(type);
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + mmq_x;
@@ -4179,7 +4218,7 @@ template <int mmq_x, bool need_check>
 #endif
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4), 1)
 #else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif
@@ -4199,9 +4238,9 @@ static __global__ void mul_mat_q_glu_nvfp4(
         return;
     }
 
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int mmq_y = get_mmq_y_device_for_type(GGML_TYPE_NVFP4);
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y;
 
@@ -4283,8 +4322,8 @@ static void launch_mul_mat_q_glu_nvfp4(ggml_backend_cuda_context & ctx, const mm
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int nwarps = mmq_get_nwarps_host_for_type(GGML_TYPE_NVFP4, cc, warp_size);
+    const int mmq_y = get_mmq_y_host_for_type(GGML_TYPE_NVFP4, cc);
 
     GGML_UNUSED(ctx);
     GGML_ASSERT(blackwell_mma_available(cc));
@@ -4381,8 +4420,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int nwarps = mmq_get_nwarps_host_for_type(type, cc, warp_size);
+    const int mmq_y = get_mmq_y_host_for_type(type, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -4487,10 +4526,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int    cc     = ggml_cuda_info().devices[id].cc;
     const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
+    const int nwarps    = mmq_get_nwarps_host_for_type(type, cc, warp_size);
 
     const int mmq_x_max = get_mmq_x_max_for_type(type, cc);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int mmq_y = get_mmq_y_host_for_type(type, cc);
 
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;

@@ -16,6 +16,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - Experimental NVFP4 MMQ+GLU fusion guarded by `GGML_CUDA_NVFP4_MMQ_GLU=1`.
 - 5070 Ti memory pressure reduction by sizing native FP4 activation scratch as FP4 blocks instead of Q8 blocks.
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
+- 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 3-CTA launch bound. This reduces dynamic shared memory for the hot `X=64` native MMQ kernel and raises achieved occupancy without changing other quantized MMQ types.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -97,6 +98,8 @@ Benchmark command:
 | Readiness/input-scale guard pass | `6167.98 +/- 9.29 t/s` | `127.14 +/- 0.69 t/s` |
 | Batch-gated `.scale` MMQ epilogue fusion | `6294.69 +/- 3.68 t/s` | `127.01 +/- 0.75 t/s` |
 | Static activation `.input_scale` quantizer | `6248.47 +/- 9.66 t/s` | `127.13 +/- 0.65 t/s` |
+| Source-aligned rerun after profiling | `6244.19 +/- 5.15 t/s` | `127.07 +/- 0.64 t/s` |
+| SM120 NVFP4 MMQ 4-warp Y64 launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -152,6 +155,12 @@ Observed completion:
 Paris is the capital of **France**.
 ```
 
+After the 4-warp Y64 MMQ pass, the same prompt again completed correctly:
+
+```text
+Paris is the capital of **France**.
+```
+
 ## Profiling
 
 `nsys` on the requested benchmark with GLU disabled showed these leading CUDA kernel costs on the 5070 Ti:
@@ -196,6 +205,50 @@ Final `nsys` with the no-env SM120 defaults:
 | `quantize_mmq_nvfp4<0>` | `0.192 s` | `4.0%` |
 
 `ncu` for `quantize_mmq_nvfp4<0>` reported 40 registers/thread, 1.02 KiB shared memory/block, 100% theoretical occupancy, 85.5% achieved occupancy, and 1.93 eligible warps/scheduler. The remaining dominant stall is long scoreboard, but the kernel is now a much smaller part of the benchmark.
+
+After adding static activation `.input_scale`, a fresh `nsys` run of the requested benchmark captured three benchmark repetitions. Per-launch comparison is therefore more useful than total time:
+
+| Kernel | Avg before static `.input_scale` | Avg with static `.input_scale` |
+| --- | ---: | ---: |
+| `mul_mat_q<NVFP4,64>` | `83.1 us` | `85.3 us` |
+| `quantize_mmq_nvfp4<0>` | `11.7 us` | `12.8 us` |
+
+The matching `ncu` samples showed:
+
+| Kernel | Duration | Registers/thread | Achieved occupancy | Eligible warps/scheduler |
+| --- | ---: | ---: | ---: | ---: |
+| `quantize_mmq_nvfp4<0>` with `.input_scale` | `39.94 us` | `39` | `86.98%` | `2.17` |
+| `mul_mat_q<NVFP4,64,apply_scale>` with `.scale * .input_scale` | `177.31 us` | `255` | `16.53%` | `0.29` |
+
+A warp-broadcast experiment for the activation input-scale lookup was tested locally. It did not improve the profiled quantizer launch (`40.06 us`) or the requested bench (`6244.45 +/- 6.67 t/s` pp15000, `127.04 +/- 0.68 t/s` tg128), so it was dropped. The next useful optimization target is the native MMQ kernel's register/shared-memory pressure, not the scalar input-scale lookup.
+
+An input-scale-era sweep of `GGML_CUDA_NVFP4_MMQ_X_MAX` kept the same conclusion: cap 64 is the best conservative setting on the 5070 Ti, while smaller caps lose prefill throughput and larger caps do not recover a repeatable win.
+
+| Cap | pp15000 | tg128 |
+| --- | ---: | ---: |
+| 32 | `5535.27 +/- 7.93 t/s` | `127.09 +/- 0.65 t/s` |
+| 40 | `5827.45 +/- 2.22 t/s` | `126.94 +/- 0.67 t/s` |
+| 48 | `6002.63 +/- 9.93 t/s` | `126.83 +/- 0.66 t/s` |
+| 56 | `5994.98 +/- 5.40 t/s` | `126.86 +/- 0.68 t/s` |
+| 64 | `6212.81 +/- 3.01 t/s` | `126.83 +/- 0.67 t/s` |
+| 72 | `6209.48 +/- 4.06 t/s` | `126.83 +/- 0.65 t/s` |
+| 80 | `6189.56 +/- 7.22 t/s` | `126.80 +/- 0.65 t/s` |
+| 96 | `6190.20 +/- 9.18 t/s` | `126.87 +/- 0.64 t/s` |
+
+A temporary local switch to disable stream-k for NVFP4 MMQ was also tested. The forced-off path was far slower than the default and was interrupted before completing the first benchmark row, so no code was kept. Stream-k should stay enabled for this workload; the next optimization has to reduce the native MMQ kernel's 255-register pressure or its shared-memory footprint rather than relying on dispatch knobs.
+
+The first structural Y64 experiment changed only `mmq_y` and failed at compile time: the current MMA writeback requires `nwarps * tile_C::I == mmq_y`. With the original 8-warp shape, `mmq_y=64` violates that invariant. The kept version therefore changes NVFP4 on Blackwell as a matched shape: 4 warps, `mmq_y=64`, and a 3-CTA launch bound. A scale-mode specialization that split `none/output/input/both` epilogues was also tested and dropped; it did not reduce the active kernel's register pressure or improve the benchmark.
+
+Final `ncu` for the simplified 4-warp Y64 `mul_mat_q<NVFP4,64,apply_scale>` showed the intended occupancy tradeoff:
+
+| Kernel shape | Registers/thread | Dynamic shared/block | Theoretical occupancy | Achieved occupancy | Active warps/SM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8-warp Y128 baseline | `255` | `~52 KiB` | `16.67%` | `16.53%` | `~7.9` |
+| 8-warp Y128 with 2-CTA launch bound | `128` | `~52 KiB` | `16.67%` | `16.49%` | `~7.9` |
+| 4-warp Y64, no register cap | `255` | `30.98 KiB` | `16.67%` | `15.63%` | `7.50` |
+| 4-warp Y64 with 3-CTA launch bound | `168` | `30.98 KiB` | `25.00%` | `22.94%` | `11.01` |
+
+The 2-CTA register-cap experiment reduced registers but did not improve occupancy because shared memory still limited the Y128 shape to one CTA per SM, so it was not kept. The 4-warp Y64 shape allows three CTAs per SM after the launch-bound register tradeoff and produced the best measured prefill result in the requested benchmark.
 
 ## Notes
 
