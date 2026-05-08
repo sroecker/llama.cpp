@@ -386,6 +386,8 @@ A record-major canonical loader was tested after the block-major pass. It loaded
 
 The SM120 stream-k fallback sweep targeted non-MoE dense NVFP4 launches that were still using `nsm` CTAs plus a fixup pass. A trace on `p512/n1` showed MoE expert dispatches already using full tile grids, while dense dispatches with `tiles=256` used the fallback path. `GGML_CUDA_NVFP4_STREAM_K_BLOCKS_PER_SM=2` improved the requested benchmark to `6538.79 +/- 13.50 t/s` pp15000 and `126.97 +/- 0.83 t/s` tg128; `=3` measured `6528.30 +/- 8.59 t/s` pp15000 and `126.93 +/- 0.91 t/s` tg128. The default for SM120 NVFP4 is therefore `2`, while other Blackwell NVFP4 targets keep the old `1` unless overridden. With the default applied, the p512 trace showed the dense `tiles=256` fallback launches using 140 CTAs instead of 70, and the requested benchmark measured `6535.31 +/- 7.49 t/s` pp15000 and `126.96 +/- 0.86 t/s` tg128.
 
+A fresh `nsys` trace after the SM120 stream-k fallback change still shows the same broad kernel ranking: `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` is 26.6% of CUDA kernel time, `gated_delta_net_cuda<128>` is 20.4%, `flash_attn_ext_f16` is 7.9%, the largest BF16 CUTLASS kernel is 7.5%, and `quantize_mmq_nvfp4<0>` is 4.8%. The next native-NVFP4 work should either further reduce the hot MMQ kernel's memory stalls or target activation quantization as a smaller, better-contained pass.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
