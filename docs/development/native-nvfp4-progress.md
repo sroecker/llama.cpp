@@ -16,7 +16,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - Experimental NVFP4 MMQ+GLU fusion guarded by `GGML_CUDA_NVFP4_MMQ_GLU=1`.
 - 5070 Ti memory pressure reduction by sizing native FP4 activation scratch as FP4 blocks instead of Q8 blocks.
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
-- 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 3-CTA launch bound. This reduces dynamic shared memory for the hot `X=64` native MMQ kernel and raises achieved occupancy without changing other quantized MMQ types.
+- 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -99,7 +99,8 @@ Benchmark command:
 | Batch-gated `.scale` MMQ epilogue fusion | `6294.69 +/- 3.68 t/s` | `127.01 +/- 0.75 t/s` |
 | Static activation `.input_scale` quantizer | `6248.47 +/- 9.66 t/s` | `127.13 +/- 0.65 t/s` |
 | Source-aligned rerun after profiling | `6244.19 +/- 5.15 t/s` | `127.07 +/- 0.64 t/s` |
-| SM120 NVFP4 MMQ 4-warp Y64 launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
+| SM120 NVFP4 MMQ 4-warp Y64 3-CTA launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
+| SM120 NVFP4 MMQ 4-warp Y64 4-CTA launch-bound hint | `6433.62 +/- 8.94 t/s` | `127.00 +/- 0.67 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -156,6 +157,12 @@ Paris is the capital of **France**.
 ```
 
 After the 4-warp Y64 MMQ pass, the same prompt again completed correctly:
+
+```text
+Paris is the capital of **France**.
+```
+
+After the 4-CTA launch-bound hint, the single-turn `llama-cli` prompt again completed correctly with `--reasoning off`:
 
 ```text
 Paris is the capital of **France**.
@@ -237,9 +244,17 @@ An input-scale-era sweep of `GGML_CUDA_NVFP4_MMQ_X_MAX` kept the same conclusion
 
 A temporary local switch to disable stream-k for NVFP4 MMQ was also tested. The forced-off path was far slower than the default and was interrupted before completing the first benchmark row, so no code was kept. Stream-k should stay enabled for this workload; the next optimization has to reduce the native MMQ kernel's 255-register pressure or its shared-memory footprint rather than relying on dispatch knobs.
 
-The first structural Y64 experiment changed only `mmq_y` and failed at compile time: the current MMA writeback requires `nwarps * tile_C::I == mmq_y`. With the original 8-warp shape, `mmq_y=64` violates that invariant. The kept version therefore changes NVFP4 on Blackwell as a matched shape: 4 warps, `mmq_y=64`, and a 3-CTA launch bound. A scale-mode specialization that split `none/output/input/both` epilogues was also tested and dropped; it did not reduce the active kernel's register pressure or improve the benchmark.
+The first structural Y64 experiment changed only `mmq_y` and failed at compile time: the current MMA writeback requires `nwarps * tile_C::I == mmq_y`. With the original 8-warp shape, `mmq_y=64` violates that invariant. The kept version therefore changes NVFP4 on Blackwell as a matched shape: 4 warps and `mmq_y=64`. A scale-mode specialization that split `none/output/input/both` epilogues was also tested and dropped; it did not reduce the active kernel's register pressure or improve the benchmark.
 
-Final `ncu` for the simplified 4-warp Y64 `mul_mat_q<NVFP4,64,apply_scale>` showed the intended occupancy tradeoff:
+The first kept Y64 pass used a 3-CTA launch-bound target. A follow-up launch-bound sweep showed that the looser 2-CTA hint regressed prefill, while the stricter 4-CTA hint improved prefill even though shared memory still caps the active blocks at three CTAs per SM:
+
+| Launch-bound hint | Active kernel registers/thread | Stack | pp15000 | tg128 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 CTAs | `255` | `8 B` | `6235.99 +/- 3.87 t/s` | `126.88 +/- 0.94 t/s` |
+| 3 CTAs | `168` | `48 B` | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
+| 4 CTAs | `128` | `72 B` | `6433.62 +/- 8.94 t/s` | `127.00 +/- 0.67 t/s` |
+
+Fresh `ncu` for the 4-CTA hint on `mul_mat_q<NVFP4,64,apply_scale>` showed that registers are no longer the active occupancy limiter:
 
 | Kernel shape | Registers/thread | Dynamic shared/block | Theoretical occupancy | Achieved occupancy | Active warps/SM |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -247,8 +262,9 @@ Final `ncu` for the simplified 4-warp Y64 `mul_mat_q<NVFP4,64,apply_scale>` show
 | 8-warp Y128 with 2-CTA launch bound | `128` | `~52 KiB` | `16.67%` | `16.49%` | `~7.9` |
 | 4-warp Y64, no register cap | `255` | `30.98 KiB` | `16.67%` | `15.63%` | `7.50` |
 | 4-warp Y64 with 3-CTA launch bound | `168` | `30.98 KiB` | `25.00%` | `22.94%` | `11.01` |
+| 4-warp Y64 with 4-CTA launch-bound hint | `128` | `30.98 KiB` | `25.00%` | `22.95%` | `11.02` |
 
-The 2-CTA register-cap experiment reduced registers but did not improve occupancy because shared memory still limited the Y128 shape to one CTA per SM, so it was not kept. The 4-warp Y64 shape allows three CTAs per SM after the launch-bound register tradeoff and produced the best measured prefill result in the requested benchmark.
+The 4-CTA hint did not raise occupancy beyond the 3-CTA result because shared memory is now the limiting resource, but it shortened the sampled 8192-grid MMQ launch from about `157.15 us` to `148.03 us`. The fresh `nsys` trace for the requested benchmark with three repetitions showed `mul_mat_q<NVFP4,64,apply_scale>` at `26.8%` of CUDA kernel time, `gated_delta_net_cuda<128>` at `20.1%`, `flash_attn_ext_f16` at `7.8%`, and `quantize_mmq_nvfp4<0>` at `4.7%`.
 
 ## Notes
 

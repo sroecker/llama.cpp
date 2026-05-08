@@ -3652,7 +3652,7 @@ template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale>
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for_type(type), type == GGML_TYPE_NVFP4 ? 3 : 1)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for_type(type), type == GGML_TYPE_NVFP4 ? 4 : 1)
 #else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
