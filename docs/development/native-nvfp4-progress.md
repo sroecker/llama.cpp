@@ -344,6 +344,8 @@ A runtime branch to skip the initial shared `ids_dst` identity initialization fo
 
 A paired-block canonical NVFP4 loader was tested to improve the misaligned q-byte traffic from the 4-byte scale header in each `block_nvfp4`. The `ncu` sample improved global-load useful bytes from about `17.2 / 32 B` to `18.9 / 32 B` and shared-store conflicts from 1.6-way to 1.4-way, but the hot specialization's stack use increased from 64 to 80 bytes and the sampled first 8192-block launch regressed slightly from `145.06 us` to `145.66 us`. The requested benchmark signal was neutral/noisy at `6470.59 +/- 10.04 t/s` pp15000 and `126.92 +/- 0.84 t/s` tg128, so the change was dropped.
 
+A no-fixup stream-k specialization was tested for the common full-tile launch where `fixup_needed == false`. It compiled the hot `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` stack frame down from 64 to 48 bytes, but did not improve runtime: the sampled 8192-block launch regressed from `145.06 us` to `147.87 us`, and the requested benchmark measured `6462.88 +/- 12.57 t/s` pp15000 and `126.94 +/- 0.86 t/s` tg128. The extra template variant was dropped.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
