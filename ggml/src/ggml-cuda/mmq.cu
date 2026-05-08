@@ -78,10 +78,7 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream
     int blocks_x = ntiles_dst;
     bool fixup_needed = false;
     if (args.use_stream_k) {
-        const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-        const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm * tiles_nwaves);
-        const int tiles_efficiency_min = get_mmq_stream_k_efficiency_min(cc);
-        blocks_x = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= tiles_efficiency_min ? ntiles_dst : nsm;
+        blocks_x = get_mmq_stream_k_blocks(GGML_TYPE_NVFP4, cc, nsm, ntiles_dst);
         fixup_needed = ntiles_dst % blocks_x != 0;
     }
 

@@ -141,6 +141,40 @@ static int get_nvfp4_mmq_x_max_env() {
     return cap;
 }
 
+static int get_nvfp4_stream_k_blocks_per_sm_env() {
+    static const int blocks_per_sm = []() {
+        const char * env = getenv("GGML_CUDA_NVFP4_STREAM_K_BLOCKS_PER_SM");
+        if (!env || !*env) {
+            return 0;
+        }
+
+        const int value = std::atoi(env);
+        return value < 0 ? 0 : value > 8 ? 8 : value;
+    }();
+
+    return blocks_per_sm;
+}
+
+static int get_mmq_stream_k_blocks(const ggml_type type, const int cc, const int nsm, const int ntiles_dst) {
+    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+    const int tiles_efficiency_min = get_mmq_stream_k_efficiency_min(cc);
+
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= tiles_efficiency_min) {
+        return ntiles_dst;
+    }
+
+    int blocks = nsm;
+    if (type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
+        const int env_blocks_per_sm = get_nvfp4_stream_k_blocks_per_sm_env();
+        const int blocks_per_sm = env_blocks_per_sm > 0 ? env_blocks_per_sm : cc == GGML_CUDA_CC_BLACKWELL ? 2 : 1;
+        blocks = nsm * blocks_per_sm;
+        blocks = blocks > ntiles_dst ? ntiles_dst : blocks;
+    }
+
+    return blocks;
+}
+
 static int get_mmq_x_max_for_type(const ggml_type type, const int cc) {
     const int mmq_x_max = get_mmq_x_max_host(cc);
 
@@ -4597,10 +4631,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const int tiles_efficiency_min = get_mmq_stream_k_efficiency_min(cc);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= tiles_efficiency_min ? ntiles_dst : nsm, 1, 1);
+    const dim3 block_nums_stream_k(get_mmq_stream_k_blocks(type, cc, nsm, ntiles_dst), 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
