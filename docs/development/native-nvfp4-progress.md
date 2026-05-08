@@ -143,6 +143,7 @@ Benchmark command:
 | Repack base-offset sidecar metadata scaffold | `6477.28 +/- 12.13 t/s` | `126.88 +/- 0.83 t/s` |
 | Repack exact-range admission scaffold | `6478.72 +/- 12.79 t/s` | `126.73 +/- 0.81 t/s` |
 | Active-expert sidecar scratch, default disabled | `6459.71 +/- 12.99 t/s` | `126.89 +/- 0.82 t/s` |
+| Dropped partial active sidecar, `ACTIVE_REPACK_MAX_EXPERTS=96` | `4249.13 +/- 8.37 t/s` | `126.94 +/- 0.85 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -346,6 +347,8 @@ The uncached large launches are almost entirely `ffn_gate_exps.weight`, `ffn_up_
 The current `x_repacked` loader also assumes the sidecar preserves the original full logical tensor address space. `MUL_MAT_ID` compacts activations and destinations through `ids_src1`, `ids_dst`, and `expert_bounds`, but weight addressing still uses the original expert/channel offset. A compact per-expert sidecar would need new metadata, such as a logical base-block offset and an expert-to-sidecar map, plus a loader path that subtracts/remaps that base. Without that, a partial sidecar would index the wrong expert or go out of bounds. For now the repack cache stays opt-in and whole-tensor only; the next real MoE-side improvement should be an explicit partial/expert sidecar design, not another admission heuristic.
 
 The active-expert trace level was tested on a `p512` smoke run. Across 234 MoE MMQ dispatches the active expert count averaged `90.28` of 128 experts, with a range from `51` to `127`; the first layer's all-expert gate/up/down dispatches each used `120` experts. That makes per-dispatch expert-slice repacking less attractive for prefill than expected: it would add new loader/addressing complexity while often repacking most of the full all-expert tensor anyway.
+
+A no-host-sync partial active sidecar was then prototyped locally: `GGML_CUDA_NVFP4_ACTIVE_REPACK_MAX_EXPERTS=96` compacted up to 96 active experts and fell back to canonical weights for the rest. Correctness passed, and a `p15000` trace showed 3,993 of 7,020 MoE MMQ launches had 96 or fewer active experts, but the requested benchmark regressed to `4249.13 +/- 8.37 t/s` pp15000. `nsys` showed the cause directly: `nvfp4_repack_mmq_active_experts_kernel` became the largest CUDA kernel cost at 34.4% of CUDA kernel time, with 7,020 launches averaging 338 us. The partial sidecar code was dropped; per-dispatch active repacking is not a good prefill direction for this 5070 Ti.
 
 The shared-memory follow-up found a host/device accounting mismatch: host launch sizing used the generic NVFP4 MMA tile stride (`84` int words/row), while the Blackwell native FP4 loader uses the FP4 stride (`76` int words/row). Correcting the host launch size dropped sampled dynamic shared memory from `30.98 Kbyte/block` to `28.93 Kbyte/block`; registers stayed at 128/thread, theoretical occupancy stayed at `25%`, and shared memory still limited the hot `mul_mat_q<NVFP4,64,apply_scale>` specialization to three CTAs/SM.
 
