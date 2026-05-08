@@ -497,6 +497,24 @@ void ggml_cuda_op_mul_mat_q(
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
+    const ggml_tensor * input_scale = nullptr;
+    if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc) &&
+            dst->op == GGML_OP_MUL_MAT && dst->src[3] && dst->src[3]->type == GGML_TYPE_F32 &&
+            ggml_nelements(dst->src[3]) == 1) {
+        input_scale = dst->src[3];
+    }
+    const float * input_scale_d = input_scale ? (const float *) input_scale->data : nullptr;
+    const int input_scale_stride = 0;
+
+    if (input_scale && ggml_cuda_nvfp4_debug_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("CUDA NVFP4 native split MMQ dispatch: weights=%s, input_scale=yes\n",
+                src0_repacked_i ? "repacked" : "canonical");
+            logged = true;
+        }
+    }
+
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
@@ -510,7 +528,7 @@ void ggml_cuda_op_mul_mat_q(
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
         nullptr, 0,
-        nullptr, 0,
+        input_scale_d, input_scale_stride,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,

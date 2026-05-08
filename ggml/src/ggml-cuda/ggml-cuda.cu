@@ -706,8 +706,32 @@ static bool ggml_cuda_nvfp4_repack_debug_enabled() {
 }
 
 static bool ggml_cuda_nvfp4_repack_split_cache_enabled() {
-    // Split MUL_MAT still prepares q8_1 activations; x_repacked NVFP4 expects FP4 activation blocks.
-    return false;
+    return true;
+}
+
+static int ggml_cuda_nvfp4_native_mode() {
+    const char * env = getenv("GGML_CUDA_NVFP4_NATIVE");
+    if (!env || strcmp(env, "auto") == 0) {
+        return -1;
+    }
+    return std::atoi(env) != 0 ? 1 : 0;
+}
+
+static bool ggml_cuda_nvfp4_native_available_for_split(const int cc) {
+    const int mode = ggml_cuda_nvfp4_native_mode();
+
+    if (mode == 0) {
+        GGML_ABORT("GGML_CUDA_NVFP4_NATIVE=0 requested, but split NVFP4 MMQ has no safe non-native fallback");
+    }
+
+    if (!blackwell_mma_available(cc)) {
+        if (mode == 1) {
+            GGML_ABORT("GGML_CUDA_NVFP4_NATIVE=1 requested, but SM120/SM121 FP4 MMA is unavailable");
+        }
+        return false;
+    }
+
+    return true;
 }
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -1029,9 +1053,6 @@ struct ggml_backend_cuda_split_buffer_context {
             GGML_LOG_INFO("CUDA NVFP4 repack cache: budget %.2f MiB for split buffer, max tensor %.2f MiB\n",
                 nvfp4_repack_cache_budget / 1024.0 / 1024.0,
                 nvfp4_repack_cache_max_tensor_size / 1024.0 / 1024.0);
-            if (!ggml_cuda_nvfp4_repack_split_cache_enabled()) {
-                GGML_LOG_INFO("CUDA NVFP4 repack cache: split-buffer sidecars disabled until split native FP4 activation quantization is wired\n");
-            }
         }
     }
 
@@ -1839,6 +1860,9 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+static bool ggml_cuda_nvfp4_debug_enabled();
+static const ggml_tensor * ggml_cuda_nvfp4_input_scale(const ggml_tensor * mm);
+
 static void ggml_cuda_op_mul_mat(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_cuda_op_mul_mat_t op,
@@ -1952,6 +1976,33 @@ static void ggml_cuda_op_mul_mat(
         }
     }
 
+    bool use_native_fp4 = split && src0->type == GGML_TYPE_NVFP4 && quantize_src1 == quantize_mmq_q8_1_cuda;
+    if (use_native_fp4) {
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            if (dev[id].row_low == dev[id].row_high) {
+                continue;
+            }
+            use_native_fp4 = use_native_fp4 && ggml_cuda_nvfp4_native_available_for_split(dev[id].cc);
+        }
+    }
+
+    const ggml_tensor * input_scale = use_native_fp4 ? ggml_cuda_nvfp4_input_scale(dst) : nullptr;
+    const float * input_scale_d = input_scale ? (const float *) input_scale->data : nullptr;
+    const int input_scale_stride = 0;
+
+    const size_t src1_q_ts = use_native_fp4 ? sizeof(block_fp4_mmq) : q8_1_ts;
+    const size_t src1_q_bs = use_native_fp4 ? QK_K : q8_1_bs;
+    const size_t src1_q_row_size = src1_padded_col_size * src1_q_ts / src1_q_bs;
+
+    if (use_native_fp4 && ggml_cuda_nvfp4_debug_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("CUDA NVFP4 native split MMQ: using FP4 activation quantizer, input_scale=%s\n",
+                input_scale ? "yes" : "no");
+            logged = true;
+        }
+    }
+
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
         if ((!split && id != ctx.device) || dev[id].row_low == dev[id].row_high) {
             continue;
@@ -2008,17 +2059,25 @@ static void ggml_cuda_op_mul_mat(
         }
 
         if (quantize_src1) {
-            size_t src_1_ddq_size = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            size_t src_1_ddq_size = nrows1 * src1_q_row_size;
             if (quantize_src1 == quantize_mmq_q8_1_cuda) {
                 src_1_ddq_size += get_mmq_x_max_host(dev[id].cc)*sizeof(block_q8_1_mmq);
             }
             dev[id].src1_ddq = dev[id].src1_ddq_alloc.alloc(ctx.pool(id), src_1_ddq_size);
 
             if (src1_on_device && src1_is_contiguous) {
-                quantize_src1(
-                    dev[id].src1_ddf, nullptr, dev[id].src1_ddq, src0->type, ne10,
-                    nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
-                    src1_padded_col_size, ne11, ne12, ne13, stream);
+                if (use_native_fp4) {
+                    quantize_mmq_fp4_cuda(
+                        dev[id].src1_ddf, nullptr, dev[id].src1_ddq, src0->type, ne10,
+                        nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                        src1_padded_col_size, ne11, ne12, ne13, input_scale_d, nullptr,
+                        input_scale ? 1 : 0, input_scale_stride, stream);
+                } else {
+                    quantize_src1(
+                        dev[id].src1_ddf, nullptr, dev[id].src1_ddq, src0->type, ne10,
+                        nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+                        src1_padded_col_size, ne11, ne12, ne13, stream);
+                }
                 CUDA_CHECK(cudaGetLastError());
             }
         }
@@ -2064,11 +2123,11 @@ static void ggml_cuda_op_mul_mat(
                 const int64_t i03 = i0 / ne12;
                 const int64_t i02 = i0 % ne12;
 
-                size_t src1_ddq_i_offset = i0*ne11 * src1_padded_col_size*q8_1_ts/q8_1_bs;
+                size_t src1_ddq_i_offset = i0 * ne11 * src1_q_row_size;
                 if (quantize_src1 == quantize_mmq_q8_1_cuda) {
                     src1_ddq_i_offset += src1_col_0 * sizeof(block_q8_1_mmq);
                 } else {
-                    src1_ddq_i_offset += src1_col_0 * src1_padded_col_size*q8_1_ts/q8_1_bs;
+                    src1_ddq_i_offset += src1_col_0 * src1_q_row_size;
                 }
 
                 // for split tensors the data begins at i0 == i0_offset_low
@@ -2092,11 +2151,11 @@ static void ggml_cuda_op_mul_mat(
                             if (quantize_src1 == quantize_mmq_q8_1_cuda) {
                                 const size_t pitch = ne11*sizeof(block_q8_1_mmq);
                                 const size_t width = src1_ncols*sizeof(block_q8_1_mmq);
-                                const size_t height = src1_padded_col_size/(4*QK8_1);
+                                const size_t height = use_native_fp4 ? src1_padded_col_size / QK_K : src1_padded_col_size/(4*QK8_1);
                                 CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(src1_ddq_i, id, pitch, src1_ddq_i_source, ctx.device, pitch, width, height, stream));
                             } else {
                                 CUDA_CHECK(cudaMemcpyPeerAsync(
-                                    src1_ddq_i, id, src1_ddq_i_source, ctx.device, src1_ncols*src1_padded_col_size*q8_1_ts/q8_1_bs, stream));
+                                    src1_ddq_i, id, src1_ddq_i_source, ctx.device, src1_ncols*src1_q_row_size, stream));
                             }
                         } else {
                             float * src1_ddf_i_source = (float *) src1->data;
@@ -2113,9 +2172,16 @@ static void ggml_cuda_op_mul_mat(
                 }
 
                 if (quantize_src1 && !src1_is_contiguous) {
-                    quantize_src1(
-                        src1_ddf_i, nullptr, src1_ddq_i, src0->type, ne10, ne10, ne11*ne10, ne12*ne11*ne10,
-                        src1_padded_col_size, src1_ncols, 1, 1, stream);
+                    if (use_native_fp4) {
+                        quantize_mmq_fp4_cuda(
+                            src1_ddf_i, nullptr, src1_ddq_i, src0->type, ne10, ne10, ne11*ne10, ne12*ne11*ne10,
+                            src1_padded_col_size, src1_ncols, 1, 1, input_scale_d, nullptr,
+                            input_scale ? 1 : 0, input_scale_stride, stream);
+                    } else {
+                        quantize_src1(
+                            src1_ddf_i, nullptr, src1_ddq_i, src0->type, ne10, ne10, ne11*ne10, ne12*ne11*ne10,
+                            src1_padded_col_size, src1_ncols, 1, 1, stream);
+                    }
                     CUDA_CHECK(cudaGetLastError());
                 }
 
