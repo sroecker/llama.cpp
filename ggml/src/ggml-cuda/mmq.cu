@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <climits>
+#include <vector>
 
 static int ggml_cuda_nvfp4_native_mode() {
     const char * env = getenv("GGML_CUDA_NVFP4_NATIVE");
@@ -21,14 +22,14 @@ static bool ggml_cuda_nvfp4_debug_enabled() {
     return env && std::atoi(env) != 0;
 }
 
-static bool ggml_cuda_nvfp4_trace_mmq_enabled() {
+static int ggml_cuda_nvfp4_trace_mmq_level() {
     const char * env = getenv("GGML_CUDA_NVFP4_TRACE_MMQ");
-    return env && std::atoi(env) != 0;
+    return env ? std::atoi(env) : 0;
 }
 
-static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args) {
-    static const bool enabled = ggml_cuda_nvfp4_trace_mmq_enabled();
-    if (!enabled || args.type_x != GGML_TYPE_NVFP4) {
+static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream) {
+    static const int trace_level = ggml_cuda_nvfp4_trace_mmq_level();
+    if (trace_level <= 0 || args.type_x != GGML_TYPE_NVFP4) {
         return;
     }
 
@@ -80,9 +81,25 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args) {
 
     const char * x_name = args.x_name && args.x_name[0] ? args.x_name : "(unnamed)";
     const char * dst_name = args.dst_name && args.dst_name[0] ? args.dst_name : "(unnamed)";
+
+    int active_experts = -1;
+    int routed_rows = -1;
+    if (trace_level >= 2 && args.expert_bounds && args.nchannels_y > 0 && args.nchannels_y < INT_MAX) {
+        std::vector<int32_t> expert_bounds(args.nchannels_y + 1);
+        CUDA_CHECK(cudaMemcpyAsync(expert_bounds.data(), args.expert_bounds,
+            expert_bounds.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        active_experts = 0;
+        routed_rows = expert_bounds.back();
+        for (int64_t i = 0; i < args.nchannels_y; ++i) {
+            active_experts += expert_bounds[i + 1] > expert_bounds[i] ? 1 : 0;
+        }
+    }
+
     fprintf(stderr,
         "CUDA NVFP4 MMQ trace:"
-        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s ids=%s out_scale=%s in_scale=%s"
+        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s ids=%s active_experts=%d routed_rows=%d out_scale=%s in_scale=%s"
         " dims=(k=%" PRId64 ",rows=%" PRId64 ",cols=%" PRId64 ",max_cols=%" PRId64 ",ch=%" PRId64 ",samples=%" PRId64 ")"
         " weight=%s dst=%s\n",
         blocks_x, ntiles_dst, mmq_x_best, mmq_y, nbytes_shared,
@@ -90,6 +107,8 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args) {
         fixup_needed ? "yes" : "no",
         args.x_repacked ? "yes" : "no",
         args.ids_dst ? "yes" : "no",
+        active_experts,
+        routed_rows,
         args.output_scale ? "yes" : "no",
         args.input_scale ? "yes" : "no",
         args.ncols_x, args.nrows_x, args.ncols_dst, args.ncols_max, args.nchannels_y, args.nsamples_y,
@@ -159,7 +178,7 @@ void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, const int64_t
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    ggml_cuda_nvfp4_mmq_trace(args);
+    ggml_cuda_nvfp4_mmq_trace(args, stream);
 
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
