@@ -99,13 +99,16 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream
 
     fprintf(stderr,
         "CUDA NVFP4 MMQ trace:"
-        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s ids=%s active_experts=%d routed_rows=%d out_scale=%s in_scale=%s"
+        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s repack_base=%" PRId64 " repack_groups=%" PRId64
+        " ids=%s active_experts=%d routed_rows=%d out_scale=%s in_scale=%s"
         " dims=(k=%" PRId64 ",rows=%" PRId64 ",cols=%" PRId64 ",max_cols=%" PRId64 ",ch=%" PRId64 ",samples=%" PRId64 ")"
         " weight=%s dst=%s\n",
         blocks_x, ntiles_dst, mmq_x_best, mmq_y, nbytes_shared,
         args.use_stream_k ? "yes" : "no",
         fixup_needed ? "yes" : "no",
         args.x_repacked ? "yes" : "no",
+        args.x_repacked_base_group,
+        args.x_repacked_ngroups,
         args.ids_dst ? "yes" : "no",
         active_experts,
         routed_rows,
@@ -114,6 +117,22 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream
         args.ncols_x, args.nrows_x, args.ncols_dst, args.ncols_max, args.nchannels_y, args.nsamples_y,
         x_name, dst_name);
     fflush(stderr);
+}
+
+static int64_t ggml_cuda_nvfp4_mmq_repack_ngroups(const ggml_tensor * tensor) {
+    if (tensor->type != GGML_TYPE_NVFP4) {
+        return 0;
+    }
+
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+    const size_t nblocks = ggml_nbytes(tensor) / sizeof(block_nvfp4);
+    return nblocks % blocks_per_group == 0 ? nblocks / blocks_per_group : 0;
+}
+
+static bool ggml_cuda_nvfp4_repack_cache_covers(
+        const ggml_cuda_nvfp4_repack_cache * cache, const int64_t base_group, const int64_t ngroups) {
+    return cache && cache->ready && ngroups > 0 &&
+        cache->base_group <= base_group && cache->base_group + cache->ngroups >= base_group + ngroups;
 }
 
 static bool ggml_cuda_nvfp4_native_available(const int cc) {
@@ -322,9 +341,14 @@ void ggml_cuda_mul_mat_q(
                                 src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_nvfp4_native_available(cc) : false;
     const ggml_cuda_nvfp4_repack_cache * repack_cache =
         src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? ggml_cuda_nvfp4_get_repack_cache(src0) : nullptr;
-    const bool use_repack_cache = repack_cache && repack_cache->ready;
+    const int64_t src0_repack_ngroups = ggml_cuda_nvfp4_mmq_repack_ngroups(src0);
+    const bool use_repack_cache = ggml_cuda_nvfp4_repack_cache_covers(repack_cache, 0, src0_repack_ngroups);
+    int64_t x_repacked_base_group = 0;
+    int64_t x_repacked_ngroups = 0;
     if (use_repack_cache) {
         src0_d = (const char *) repack_cache->data;
+        x_repacked_base_group = repack_cache->base_group;
+        x_repacked_ngroups = repack_cache->ngroups;
 
         if (ggml_cuda_nvfp4_debug_enabled()) {
             static bool logged = false;
@@ -403,6 +427,7 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1,
             use_repack_cache,
+            x_repacked_base_group, x_repacked_ngroups,
             src0->name, dst->name};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
@@ -467,6 +492,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12,
         use_repack_cache,
+        x_repacked_base_group, x_repacked_ngroups,
         src0->name, dst->name};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
@@ -626,6 +652,9 @@ void ggml_cuda_op_mul_mat_q(
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
+    const int64_t x_repacked_ngroups =
+        src0_repacked_i && src0->type == GGML_TYPE_NVFP4 && ne00 % MMQ_ITER_K_FP4 == 0 ?
+            row_diff * (ne00 / MMQ_ITER_K_FP4) : 0;
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
         nullptr, 0,
@@ -635,6 +664,7 @@ void ggml_cuda_op_mul_mat_q(
         1, 1, 0, 0, 0,
         use_stream_k, src1_ncols,
         src0_repacked_i,
+        0, x_repacked_ngroups,
         src0->name, dst->name};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);

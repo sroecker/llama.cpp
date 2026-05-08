@@ -21,6 +21,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
 - The Blackwell FP4 MMA dot loop now loads each B fragment immediately before the fragment's MMA work and uses an explicit per-output accumulator base, shortening B fragment lifetime without changing the shared layout, tile geometry, or scale semantics.
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
+- Repack sidecars now carry `base_group` and `ngroups` metadata. Current full-tensor and split-buffer sidecars use `base_group=0`, while the repacked SM120 loader subtracts the base group from the logical group index. This is a scaffold for later partial/expert-local sidecars; no sparse expert remapping is admitted yet.
 - Split-buffer NVFP4 MMQ now stages runtime activations as FP4 blocks on SM120 instead of q8_1 blocks before enabling split-buffer `x_repacked=true`.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
 - `GGML_CUDA_NVFP4_TRACE_MMQ=1` emits one stderr line per native NVFP4 MMQ dispatch with launch tile count, selected MMQ shape, stream-k/fixup state, scale metadata, `x_repacked` state, `ids` state, tensor dimensions, and tensor names. `GGML_CUDA_NVFP4_TRACE_MMQ=2` additionally copies MoE `expert_bounds` and reports active experts. This is intentionally opt-in because the requested benchmark emits thousands of lines.
@@ -58,6 +59,8 @@ GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_INPUT_SC
 GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_NVFP4_NATIVE -b CUDA0
 GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops perf -o MUL_MAT_NVFP4_NATIVE -b CUDA0
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
+GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_TRACE_MMQ=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
+GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID -b CUDA0 -p 'type_a=nvfp4'
 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=mxfp4'
 ```
 
@@ -76,6 +79,8 @@ Results:
 - Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
 - Debug input-scale smoke: dense and `MUL_MAT_ID` input-scale tests both logged activation `input_scale` consumption in the MMQ quantizer.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` `MUL_MAT type_a=nvfp4`: 41/41 passed, with the debug log confirming that the sidecar MMQ weight loader was selected on eligible k=1024 cases.
+- Repack base-offset scaffold: `MUL_MAT type_a=nvfp4` 41/41 passed and `MUL_MAT_ID type_a=nvfp4` 72/72 passed with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64`.
+- `GGML_CUDA_NVFP4_TRACE_MMQ=1` confirmed the eligible k=1024 sidecar path reports `repacked=yes repack_base=0 repack_groups=192`.
 - `MUL_MAT type_a=mxfp4`: 41/41 passed after the shared Blackwell FP4 dot-loop lifetime change.
 
 Debug readiness smoke test:
@@ -130,6 +135,7 @@ Benchmark command:
 | Split sidecar gated off + `CACHE_MB=128` sanity, `-r 1` | `6511.15 +/- 0.00 t/s` | `126.08 +/- 0.00 t/s` |
 | Split native FP4 staging + `CACHE_MB=128` sanity, `-r 1` | `6510.95 +/- 0.00 t/s` | `126.06 +/- 0.00 t/s` |
 | Blackwell FP4 B-fragment lifetime pass | `6484.09 +/- 11.69 t/s` | `126.97 +/- 0.84 t/s` |
+| Repack base-offset sidecar metadata scaffold | `6477.28 +/- 12.13 t/s` | `126.88 +/- 0.83 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -339,6 +345,10 @@ The shared-memory follow-up found a host/device accounting mismatch: host launch
 A fresh `ncu` sample of the current kept `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` specialization on the first 8192-block MoE launch reported `145.06 us`, 128 registers/thread, `28,928` bytes dynamic shared memory/block, 25% theoretical occupancy, 22.83% achieved occupancy, 0.36 eligible warps/scheduler, 63.45% DRAM throughput, and 47.61% SM throughput. The main reported issues remain memory pressure and uncoalesced/shared traffic: global load useful bytes were about `17.2 / 32 B`, shared stores had 1.6-way conflicts with 798,628 bank conflicts, and stall sampling was led by long scoreboard, wait, MIO throttle, and LG throttle.
 
 The kept FP4 dot-loop lifetime pass changed only `vec_dot_fp4_fp4_mma`: B fragments are loaded one fragment at a time immediately before their MMA work, and the accumulator pointer is hoisted per `j0,n` output tile. This leaves the shared layout, row stride, stream-k behavior, tile shape, and block-scale semantics unchanged. `cuobjdump` remained at 128 registers/thread and a 64-byte stack for the hot no-check/apply-scale specialization. The same first 8192-block MoE `ncu` sample measured `144.80 us`, 22.86% achieved occupancy, `17.2 / 32 B` global-load useful bytes, and 793,948 shared-store bank conflicts. The requested benchmark measured `6484.09 +/- 11.69 t/s` pp15000 and `126.97 +/- 0.84 t/s` tg128, so the change is kept as a small pressure-neutral cleanup with a slight positive signal.
+
+A post-commit `nsys` trace on `b05064e1b` kept the same kernel ranking: `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` was 26.5% of CUDA kernel time, `gated_delta_net_cuda<128>` was 20.2%, `flash_attn_ext_f16` was 7.9%, the largest BF16 CUTLASS kernel was 7.4%, and `quantize_mmq_nvfp4<0>` was 4.7%. This confirms NVFP4 MMQ is still the main native-FP4 target, but the next largest model hotspot is outside NVFP4.
+
+An A-fragment on-demand experiment removed the preloaded `A[ntx][nfrags]` and `scaleA[ntx][nfrags]` arrays from `vec_dot_fp4_fp4_mma` and loaded A fragments immediately before MMA use. Correctness passed, but the hot no-check/apply-scale stack increased from 64 to 80 bytes, the same first 8192-block `ncu` launch regressed to `147.10 us`, and the requested benchmark regressed to `6439.69 +/- 8.14 t/s` pp15000 and `126.79 +/- 0.93 t/s` tg128. The change was dropped; the extra shared reloads and/or worse scheduling cost more than the shorter A lifetime helps.
 
 A 48-row, 3-warp NVFP4 tile was tested and dropped. It satisfies `nwarps * tile_C::I == mmq_y`, but it violates the `ntx=2` row-pairing requirement used when `mmq_x >= 48`; focused NVFP4 tests caught an illegal memory access. A safer `MMQ_X_MAX=32` sweep can fit under the 4-CTA shared-memory threshold with the corrected accounting, but it regressed pp15000 to `6103.98 +/- 13.44 t/s`, so the default stays at `MMQ_X_MAX=64`.
 

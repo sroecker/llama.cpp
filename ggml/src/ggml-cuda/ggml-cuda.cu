@@ -687,6 +687,12 @@ static size_t ggml_cuda_nvfp4_repack_cache_nbytes_from_nblocks(const size_t nblo
     return (nblocks / blocks_per_group) * (ints_per_group * sizeof(uint32_t));
 }
 
+static int64_t ggml_cuda_nvfp4_repack_cache_ngroups_from_nblocks(const size_t nblocks) {
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+
+    return nblocks % blocks_per_group == 0 ? nblocks / blocks_per_group : 0;
+}
+
 static size_t ggml_cuda_nvfp4_repack_cache_nbytes(const ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_NVFP4 || tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
         return 0;
@@ -780,6 +786,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
             ggml_cuda_nvfp4_repack_cache * cache = new ggml_cuda_nvfp4_repack_cache{};
             cache->data = cache_data;
             cache->size = nvfp4_repack_size;
+            cache->base_group = 0;
+            cache->ngroups = ggml_cuda_nvfp4_repack_cache_ngroups_from_nblocks(ggml_nbytes(tensor) / sizeof(block_nvfp4));
             tensor->extra = cache;
             ctx->nvfp4_repack_caches.push_back(cache);
             ctx->nvfp4_repack_cache_used += nvfp4_repack_size;
@@ -1148,6 +1156,8 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
                 ggml_cuda_nvfp4_repack_cache * cache = new ggml_cuda_nvfp4_repack_cache{};
                 cache->data = cache_data;
                 cache->size = nvfp4_repack_size;
+                cache->base_group = 0;
+                cache->ngroups = ggml_cuda_nvfp4_repack_cache_ngroups_from_nblocks(original_size / sizeof(block_nvfp4));
                 extra->nvfp4_repack_cache[id] = cache;
                 ctx->nvfp4_repack_caches.push_back(cache);
                 ctx->nvfp4_repack_cache_used += nvfp4_repack_size;

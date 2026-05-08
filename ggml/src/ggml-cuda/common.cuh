@@ -1174,6 +1174,8 @@ struct ggml_cuda_nvfp4_repack_cache {
     uint32_t magic = GGML_CUDA_NVFP4_REPACK_CACHE_MAGIC;
     void * data = nullptr;
     size_t size = 0;
+    int64_t base_group = 0;
+    int64_t ngroups = 0;
     bool ready = false;
 };
 
