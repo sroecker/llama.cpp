@@ -144,6 +144,7 @@ Benchmark command:
 | Repack exact-range admission scaffold | `6478.72 +/- 12.79 t/s` | `126.73 +/- 0.81 t/s` |
 | Active-expert sidecar scratch, default disabled | `6459.71 +/- 12.99 t/s` | `126.89 +/- 0.82 t/s` |
 | Dropped partial active sidecar, `ACTIVE_REPACK_MAX_EXPERTS=96` | `4249.13 +/- 8.37 t/s` | `126.94 +/- 0.85 t/s` |
+| Dropped bank-ordered NVFP4 row loader | `6447.84 +/- 14.36 t/s` | `126.88 +/- 0.89 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -369,6 +370,8 @@ An NVFP4-only Blackwell X-tile stride experiment removed the four trailing paddi
 A runtime branch to skip the initial shared `ids_dst` identity initialization for MoE kernels was also tested and dropped. It removed redundant stores on the `ids_dst` path and passed focused dense/MoE NVFP4 tests, but the requested benchmark regressed to `6415.26 +/- 10.74 t/s` pp15000, `126.92 +/- 0.88 t/s` tg128. The branch/barrier shape costs more than the redundant initialization in the current generic stream-k kernel.
 
 A paired-block canonical NVFP4 loader was tested to improve the misaligned q-byte traffic from the 4-byte scale header in each `block_nvfp4`. The `ncu` sample improved global-load useful bytes from about `17.2 / 32 B` to `18.9 / 32 B` and shared-store conflicts from 1.6-way to 1.4-way, but the hot specialization's stack use increased from 64 to 80 bytes and the sampled first 8192-block launch regressed slightly from `145.06 us` to `145.66 us`. The requested benchmark signal was neutral/noisy at `6470.59 +/- 10.04 t/s` pp15000 and `126.92 +/- 0.84 t/s` tg128, so the change was dropped.
+
+A bank-ordered NVFP4 row-loader experiment kept the same shared-memory layout but permuted the four rows handled by each warp so stores landed on disjoint banks with the 76-int FP4 row stride. Correctness passed, and `ncu` showed shared excessive wavefronts dropping to 307,200, but the sampled first 8192-block launch was `146.34 us` and the requested benchmark measured `6447.84 +/- 14.36 t/s` pp15000, `126.88 +/- 0.89 t/s` tg128. The added row-addressing work and/or changed load issue pattern did not translate into throughput, so the code was dropped.
 
 A no-fixup stream-k specialization was tested for the common full-tile launch where `fixup_needed == false`. It compiled the hot `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` stack frame down from 64 to 48 bytes, but did not improve runtime: the sampled 8192-block launch regressed from `145.06 us` to `147.87 us`, and the requested benchmark measured `6462.88 +/- 12.57 t/s` pp15000 and `126.94 +/- 0.86 t/s` tg128. The extra template variant was dropped.
 
