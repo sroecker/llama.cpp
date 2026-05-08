@@ -342,6 +342,8 @@ An NVFP4-only Blackwell X-tile stride experiment removed the four trailing paddi
 
 A runtime branch to skip the initial shared `ids_dst` identity initialization for MoE kernels was also tested and dropped. It removed redundant stores on the `ids_dst` path and passed focused dense/MoE NVFP4 tests, but the requested benchmark regressed to `6415.26 +/- 10.74 t/s` pp15000, `126.92 +/- 0.88 t/s` tg128. The branch/barrier shape costs more than the redundant initialization in the current generic stream-k kernel.
 
+A paired-block canonical NVFP4 loader was tested to improve the misaligned q-byte traffic from the 4-byte scale header in each `block_nvfp4`. The `ncu` sample improved global-load useful bytes from about `17.2 / 32 B` to `18.9 / 32 B` and shared-store conflicts from 1.6-way to 1.4-way, but the hot specialization's stack use increased from 64 to 80 bytes and the sampled first 8192-block launch regressed slightly from `145.06 us` to `145.66 us`. The requested benchmark signal was neutral/noisy at `6470.59 +/- 10.04 t/s` pp15000 and `126.92 +/- 0.84 t/s` tg128, so the change was dropped.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
