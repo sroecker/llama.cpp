@@ -1073,6 +1073,53 @@ static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4(const char * __res
     }
 }
 
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_nvfp4_nvfp4_repacked(const char * __restrict__ x,
+                                                                       int * __restrict__ x_tile,
+                                                                       const int kbx0,
+                                                                       const int i_max,
+                                                                       const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device_for_type(GGML_TYPE_NVFP4);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int iter_k = get_iter_k(GGML_TYPE_NVFP4);
+    constexpr int blocks_per_row = iter_k / QK_NVFP4;
+    constexpr int words_per_block = QK_NVFP4 / 8;
+    static_assert(blocks_per_row == words_per_block, "NVFP4 MMQ loader assumes one lane per 32-bit q word");
+    constexpr int q_words_per_group = blocks_per_row * words_per_block;
+    constexpr int scale_words_per_group = blocks_per_row;
+    constexpr int words_per_group = q_words_per_group + scale_words_per_group;
+    constexpr int threads_per_row = blocks_per_row;
+    constexpr int rows_per_warp = warp_size / threads_per_row;
+
+    uint32_t * x_u32 = (uint32_t *) x_tile;
+    uint32_t * x_u32_scale = x_u32 + 64;
+    const uint32_t * x_repacked = (const uint32_t *) x;
+
+    const int txi = threadIdx.x;
+    const int word_in_block = txi % threads_per_row;
+    const int row_in_warp = txi / threads_per_row;
+    const int k_group = kbx0 / blocks_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (need_check) {
+            i = min(i, i_max);
+        }
+
+        const uint32_t * src_group = x_repacked + (int64_t(i) * (stride / blocks_per_row) + k_group) * words_per_group;
+        const int row_base = i * MMQ_MMA_TILE_X_K_FP4;
+
+#pragma unroll
+        for (int kb = 0; kb < blocks_per_row; ++kb) {
+            x_u32[row_base + words_per_block * kb + word_in_block] = src_group[words_per_block * kb + word_in_block];
+        }
+
+        x_u32_scale[row_base + word_in_block] = src_group[q_words_per_group + word_in_block];
+    }
+}
+
 // Shared MMA kernel for MXFP4 and NVFP4 on Blackwell.
 // Both quantizations encode values as e2m1 (FP4) and produce one uint32 scale per
 // m16n8k64 MMA call; only the PTX kind (scale_vec::2X ue8m0 vs scale_vec::4X ue4m3)
@@ -3560,7 +3607,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool apply_output_scale>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool apply_output_scale, bool x_repacked>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3572,7 +3619,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int              nwarps     = mmq_get_nwarps_device_for_type(type);
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
     constexpr int              mmq_y      = get_mmq_y_device_for_type(type);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr load_tiles_mmq_t load_tiles =
+        (x_repacked && type == GGML_TYPE_NVFP4) ?
+            load_tiles_nvfp4_nvfp4_repacked<mmq_y, need_check> :
+            mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
+#else
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + mmq_x;
@@ -3644,7 +3698,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale>
+template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale, bool x_repacked>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3754,7 +3808,7 @@ static __global__ void mul_mat_q(
             (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale, x_repacked>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, output_scale_value);
         return;
@@ -3837,7 +3891,7 @@ static __global__ void mul_mat_q(
             (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale, x_repacked>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, output_scale_value);
 
@@ -3909,7 +3963,7 @@ static __global__ void mul_mat_q(
         (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, apply_output_scale, x_repacked>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, output_scale_value);
 }
@@ -4061,6 +4115,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    bool x_repacked;
 };
 
 template<ggml_type type>
@@ -4378,12 +4433,12 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
-template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale>
+template <ggml_type type, int mmq_x, bool need_check, bool apply_output_scale, bool x_repacked>
 static void launch_mul_mat_q_kernel(
         const mmq_args & args, const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
         cudaStream_t stream, float * tmp_fixup, const uint3 blocks_per_ne00_fd, const uint3 channel_ratio_fd,
         const uint3 nchannels_y_fd, const uint3 sample_ratio_fd, const uint3 nsamples_y_fd, const uint3 ntx_fd) {
-    mul_mat_q<type, mmq_x, need_check, apply_output_scale><<<block_nums, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, mmq_x, need_check, apply_output_scale, x_repacked><<<block_nums, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup,
          args.output_scale, args.output_scale_stride, args.input_scale, args.input_scale_stride,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -4398,18 +4453,32 @@ static void launch_mul_mat_q_kernel_maybe_scaled(
         cudaStream_t stream, float * tmp_fixup, const uint3 blocks_per_ne00_fd, const uint3 channel_ratio_fd,
         const uint3 nchannels_y_fd, const uint3 sample_ratio_fd, const uint3 nsamples_y_fd, const uint3 ntx_fd) {
     if constexpr (type == GGML_TYPE_NVFP4) {
+        if (args.x_repacked) {
+            if (args.output_scale || args.input_scale) {
+                launch_mul_mat_q_kernel<type, mmq_x, need_check, true, true>(
+                    args, block_nums, block_dims, nbytes_shared, stream, tmp_fixup, blocks_per_ne00_fd,
+                    channel_ratio_fd, nchannels_y_fd, sample_ratio_fd, nsamples_y_fd, ntx_fd);
+            } else {
+                launch_mul_mat_q_kernel<type, mmq_x, need_check, false, true>(
+                    args, block_nums, block_dims, nbytes_shared, stream, tmp_fixup, blocks_per_ne00_fd,
+                    channel_ratio_fd, nchannels_y_fd, sample_ratio_fd, nsamples_y_fd, ntx_fd);
+            }
+            return;
+        }
+
         if (args.output_scale || args.input_scale) {
-            launch_mul_mat_q_kernel<type, mmq_x, need_check, true>(
+            launch_mul_mat_q_kernel<type, mmq_x, need_check, true, false>(
                 args, block_nums, block_dims, nbytes_shared, stream, tmp_fixup, blocks_per_ne00_fd,
                 channel_ratio_fd, nchannels_y_fd, sample_ratio_fd, nsamples_y_fd, ntx_fd);
             return;
         }
     } else {
+        GGML_ASSERT(!args.x_repacked);
         GGML_ASSERT(args.output_scale == nullptr);
         GGML_ASSERT(args.input_scale  == nullptr);
     }
 
-    launch_mul_mat_q_kernel<type, mmq_x, need_check, false>(
+    launch_mul_mat_q_kernel<type, mmq_x, need_check, false, false>(
         args, block_nums, block_dims, nbytes_shared, stream, tmp_fixup, blocks_per_ne00_fd,
         channel_ratio_fd, nchannels_y_fd, sample_ratio_fd, nsamples_y_fd, ntx_fd);
 }
@@ -4427,11 +4496,15 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false, false>), nbytes_shared);
     if constexpr (type == GGML_TYPE_NVFP4) {
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true>), nbytes_shared);
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true, false>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true, false>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true, true>), nbytes_shared);
     }
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;

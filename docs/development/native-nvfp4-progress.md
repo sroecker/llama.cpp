@@ -18,6 +18,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - 5070 Ti NVFP4 MMQ X tile cap of 64 by default on SM120, with `GGML_CUDA_NVFP4_MMQ_X_MAX` available for local tuning.
 - 5070 Ti NVFP4 MMQ now uses a 4-warp, Y=64 Blackwell tile with a 4-CTA launch-bound hint. Shared memory still limits the hot kernel to three CTAs per SM, but the stricter hint reduces register allocation from 168 to 128 registers/thread and improves prefill throughput without changing other quantized MMQ types.
 - The SM120 NVFP4 weight loader now maps the 8 lanes assigned to a row over 32-bit words within each FP4 block instead of assigning one 36-byte `block_nvfp4` to each lane. This keeps the shared tile layout unchanged while making the packed weight loads and shared stores less strided.
+- An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - 5070 Ti NVFP4 activation quantization uses direct max-derived subblock scales by default on SM120, with `GGML_CUDA_NVFP4_QUANT_SCALE_RADIUS=2` available to restore the previous scale search.
 - NVFP4 `.scale` tensors are now applied to the base matmul result before bias and before LoRA deltas for the qwen35moe paths covered here.
 - Eligible NVFP4 `.scale` multiplies are fused into the native CUDA MMQ write-back epilogue for dense `MUL_MAT` and MoE `MUL_MAT_ID` prefill/batch cases. Decode-sized batches stay on MMVQ to avoid regressing token generation.
@@ -49,6 +50,7 @@ GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_SCALE -b CU
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_INPUT_SCALE -b CUDA0
 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID_INPUT_SCALE -b CUDA0
+GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
 ```
 
 Results:
@@ -62,6 +64,7 @@ Results:
 - `MUL_MAT_ID_INPUT_SCALE`: 1/1 passed.
 - Debug scale-fusion smoke: dense and `MUL_MAT_ID` scale tests both logged MMQ epilogue fusion.
 - Debug input-scale smoke: dense and `MUL_MAT_ID` input-scale tests both logged activation `input_scale` consumption in the MMQ quantizer.
+- `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` `MUL_MAT type_a=nvfp4`: 41/41 passed, with the debug log confirming that the sidecar MMQ weight loader was selected on eligible k=1024 cases.
 
 Debug readiness smoke test:
 
@@ -103,6 +106,9 @@ Benchmark command:
 | SM120 NVFP4 MMQ 4-warp Y64 3-CTA launch-bound pass | `6321.87 +/- 8.76 t/s` | `127.02 +/- 0.68 t/s` |
 | SM120 NVFP4 MMQ 4-warp Y64 4-CTA launch-bound hint | `6433.62 +/- 8.94 t/s` | `127.00 +/- 0.67 t/s` |
 | SM120 NVFP4 lane-remapped weight loader | `6480.10 +/- 6.03 t/s` | `127.06 +/- 0.66 t/s` |
+| Current source, repack cache disabled | `6470.57 +/- 3.89 t/s` | `126.91 +/- 0.89 t/s` |
+| `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` | `6479.81 +/- 17.12 t/s` | `126.96 +/- 0.92 t/s` |
+| `GGML_CUDA_NVFP4_REPACK_CACHE_MB=256` | `6469.15 +/- 14.25 t/s` | `126.89 +/- 0.95 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
@@ -281,10 +287,15 @@ The active specialization remains resource-stable at 128 registers/thread and 30
 
 A frag-major MMA staging experiment was also tested to reduce live A/B fragments. It passed the focused NVFP4 tests, but it increased the active no-check/apply-scale stack to `80 B` and regressed the r3 benchmark to `6456.25 +/- 9.05 t/s` pp15000 versus `6475.53 +/- 8.04 t/s` for the kept lane-remapped loader, so that staging change was dropped.
 
+The first opt-in repack-cache prototype passed correctness but did not produce a reliable benchmark win. A 64 MiB cache budget stores sidecars for 47 tensors in this model load and the `nsys` pass showed the cached specialization as real but small: `mul_mat_q<NVFP4,64,apply_scale,x_repacked=false>` remained about `25.3%` of CUDA kernel time, while `x_repacked=true` was about `1.1%`. The upload-time `nvfp4_repack_mmq_kernel` was negligible after model load.
+
+`ncu` on the cached specialization reported 128 registers/thread and 30.98 KiB dynamic shared memory/block, matching the current uncached specialization's resource shape. The sampled cached launch had only a 70-block grid, so achieved occupancy was low (`8.32%`) due to underfilled work rather than a new resource cliff. Because the r3 benchmark is within noise at 64 MiB and slightly worse at 256 MiB, the cache stays opt-in rather than becoming the default.
+
 ## Notes
 
 - `llama-cli --no-conversation` is rejected for this chat-template model; `-st` was used for a single-turn `llama-cli` check.
-- `llama-completion -no-cnv` also completed the raw prompt with `France`.
+- `llama-cli -st --reasoning off` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed `Paris is the capital of` as `Paris is the capital of **France**.`
+- `llama-completion -no-cnv` with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` completed the raw prompt with `France`.
 - The first `.scale` epilogue fusion draft applied to decode-sized workloads too and dropped `tg128` to about `107 t/s`; the current version mirrors normal dispatch and only fuses cases that should use MMQ rather than MMVQ.
 - The first priority for the 5070 Ti is keeping the native path within the 16 GB memory envelope while preserving correctness.
 - Profiling artifacts are local under `profiles/native-nvfp4/` and are not intended for upstream submission.

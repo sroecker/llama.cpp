@@ -1173,6 +1173,26 @@ struct ggml_tensor_extra_gpu {
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
 };
 
+static constexpr uint32_t GGML_CUDA_NVFP4_REPACK_CACHE_MAGIC = 0x4E563450u; // "NV4P"
+
+struct ggml_cuda_nvfp4_repack_cache {
+    uint32_t magic = GGML_CUDA_NVFP4_REPACK_CACHE_MAGIC;
+    void * data = nullptr;
+    size_t size = 0;
+    bool ready = false;
+};
+
+static inline ggml_cuda_nvfp4_repack_cache * ggml_cuda_nvfp4_get_repack_cache(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->extra == nullptr) {
+        return nullptr;
+    }
+
+    ggml_cuda_nvfp4_repack_cache * cache = (ggml_cuda_nvfp4_repack_cache *) tensor->extra;
+    return cache->magic == GGML_CUDA_NVFP4_REPACK_CACHE_MAGIC ? cache : nullptr;
+}
+
+void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, int64_t nblocks, cudaStream_t stream);
+
 
 #if (defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS)) || defined(GGML_MUSA_GRAPHS)
 #define USE_CUDA_GRAPH

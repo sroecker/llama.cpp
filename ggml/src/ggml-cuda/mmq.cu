@@ -46,6 +46,40 @@ static bool ggml_cuda_nvfp4_native_available(const int cc) {
     return true;
 }
 
+static __global__ void nvfp4_repack_mmq_kernel(const block_nvfp4 * src, uint32_t * dst, const int64_t ngroups) {
+    const int64_t group = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (group >= ngroups) {
+        return;
+    }
+
+    const block_nvfp4 * src_group = src + group * (MMQ_ITER_K_FP4 / QK_NVFP4);
+    uint32_t * dst_group = dst + group * (MMQ_ITER_K_FP4 / 8 + MMQ_ITER_K_FP4 / QK_NVFP4);
+
+#pragma unroll
+    for (int kb = 0; kb < MMQ_ITER_K_FP4 / QK_NVFP4; ++kb) {
+        const uint32_t * src_qs = (const uint32_t *) src_group[kb].qs;
+#pragma unroll
+        for (int w = 0; w < QK_NVFP4 / 8; ++w) {
+            dst_group[(QK_NVFP4 / 8) * kb + w] = src_qs[w];
+        }
+
+        dst_group[MMQ_ITER_K_FP4 / 8 + kb] = *((const uint32_t *) src_group[kb].d);
+    }
+}
+
+void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, const int64_t nblocks, cudaStream_t stream) {
+    GGML_ASSERT(nblocks % (MMQ_ITER_K_FP4 / QK_NVFP4) == 0);
+
+    const int64_t ngroups = nblocks / (MMQ_ITER_K_FP4 / QK_NVFP4);
+    if (ngroups == 0) {
+        return;
+    }
+
+    const int block_size = 128;
+    const dim3 block_nums((ngroups + block_size - 1) / block_size);
+    nvfp4_repack_mmq_kernel<<<block_nums, block_size, 0, stream>>>((const block_nvfp4 *) src, (uint32_t *) dst, ngroups);
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -187,6 +221,20 @@ void ggml_cuda_mul_mat_q(
 
     const bool use_native_fp4 = src0->type == GGML_TYPE_MXFP4 ? blackwell_mma_available(cc) :
                                 src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_nvfp4_native_available(cc) : false;
+    const ggml_cuda_nvfp4_repack_cache * repack_cache =
+        src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? ggml_cuda_nvfp4_get_repack_cache(src0) : nullptr;
+    const bool use_repack_cache = repack_cache && repack_cache->ready;
+    if (use_repack_cache) {
+        src0_d = (const char *) repack_cache->data;
+
+        if (ggml_cuda_nvfp4_debug_enabled()) {
+            static bool logged = false;
+            if (!logged) {
+                GGML_LOG_INFO("CUDA NVFP4 repack cache: using MMQ sidecar weights\n");
+                logged = true;
+            }
+        }
+    }
 
     if (output_scale) {
         GGML_ASSERT(use_native_fp4);
@@ -243,7 +291,8 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1,
+            use_repack_cache};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -305,7 +354,8 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12,
+        use_repack_cache};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -453,7 +503,8 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols,
+        false};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 
