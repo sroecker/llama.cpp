@@ -8620,6 +8620,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, false));
     test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256, true));
     test_cases.emplace_back(new test_mul_mat_id_input_scale(GGML_TYPE_NVFP4, 8, 2, false, 32, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 4, false, 64, 17, 1024));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {

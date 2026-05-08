@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -25,6 +26,11 @@ static bool ggml_cuda_nvfp4_debug_enabled() {
 static int ggml_cuda_nvfp4_trace_mmq_level() {
     const char * env = getenv("GGML_CUDA_NVFP4_TRACE_MMQ");
     return env ? std::atoi(env) : 0;
+}
+
+static int ggml_cuda_nvfp4_active_repack_max_experts() {
+    const char * env = getenv("GGML_CUDA_NVFP4_ACTIVE_REPACK_MAX_EXPERTS");
+    return env ? std::max(0, std::atoi(env)) : 0;
 }
 
 static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream) {
@@ -99,7 +105,8 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream
 
     fprintf(stderr,
         "CUDA NVFP4 MMQ trace:"
-        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s repack_base=%" PRId64 " repack_groups=%" PRId64
+        " blocks=%d tiles=%d x=%d y=%d smem=%d stream_k=%s fixup=%s repacked=%s repack_map=%s"
+        " repack_base=%" PRId64 " repack_groups=%" PRId64
         " ids=%s active_experts=%d routed_rows=%d out_scale=%s in_scale=%s"
         " dims=(k=%" PRId64 ",rows=%" PRId64 ",cols=%" PRId64 ",max_cols=%" PRId64 ",ch=%" PRId64 ",samples=%" PRId64 ")"
         " weight=%s dst=%s\n",
@@ -107,6 +114,7 @@ static void ggml_cuda_nvfp4_mmq_trace(const mmq_args & args, cudaStream_t stream
         args.use_stream_k ? "yes" : "no",
         fixup_needed ? "yes" : "no",
         args.x_repacked ? "yes" : "no",
+        args.x_repacked_expert_map ? "yes" : "no",
         args.x_repacked_base_group,
         args.x_repacked_ngroups,
         args.ids_dst ? "yes" : "no",
@@ -127,6 +135,13 @@ static int64_t ggml_cuda_nvfp4_mmq_repack_ngroups(const ggml_tensor * tensor) {
     constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
     const size_t nblocks = ggml_nbytes(tensor) / sizeof(block_nvfp4);
     return nblocks % blocks_per_group == 0 ? nblocks / blocks_per_group : 0;
+}
+
+static size_t ggml_cuda_nvfp4_mmq_repack_nbytes_from_ngroups(const int64_t ngroups) {
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+    constexpr int words_per_group  = MMQ_ITER_K_FP4 / 8 + blocks_per_group;
+
+    return ngroups <= 0 ? 0 : size_t(ngroups) * words_per_group * sizeof(uint32_t);
 }
 
 static bool ggml_cuda_nvfp4_repack_cache_covers(
@@ -246,6 +261,76 @@ void ggml_cuda_nvfp4_repack_mmq_cuda(const char * src, void * dst, const int64_t
 
     const int64_t ngroups = nblocks / (MMQ_ITER_K_FP4 / QK_NVFP4);
     ggml_cuda_nvfp4_repack_mmq_range_cuda(src, dst, 0, ngroups, stream);
+}
+
+static __global__ void nvfp4_active_expert_map_kernel(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ expert_map, const int n_experts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    int active_slot = 0;
+    for (int expert = 0; expert < n_experts; ++expert) {
+        const bool active = expert_bounds[expert + 1] > expert_bounds[expert];
+        expert_map[expert] = active ? active_slot++ : -1;
+    }
+}
+
+static __global__ void nvfp4_repack_mmq_active_experts_kernel(
+        const block_nvfp4 * __restrict__ src, uint32_t * __restrict__ dst,
+        const int32_t * __restrict__ expert_map, const int64_t n_experts,
+        const int64_t rows_per_expert, const int64_t groups_per_row,
+        const int64_t stride_row, const int64_t stride_channel) {
+    constexpr int blocks_per_group = MMQ_ITER_K_FP4 / QK_NVFP4;
+    constexpr int words_per_group  = MMQ_ITER_K_FP4 / 8 + blocks_per_group;
+
+    const int64_t group = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total_groups = n_experts * rows_per_expert * groups_per_row;
+    if (group >= total_groups) {
+        return;
+    }
+
+    const int64_t k_group = group % groups_per_row;
+    const int64_t row = (group / groups_per_row) % rows_per_expert;
+    const int64_t expert = group / (rows_per_expert * groups_per_row);
+
+    const int32_t active_slot = expert_map[expert];
+    if (active_slot < 0) {
+        return;
+    }
+
+    const block_nvfp4 * src_group = src + expert * stride_channel + row * stride_row + k_group * blocks_per_group;
+    uint32_t * dst_group = dst + (int64_t(active_slot) * rows_per_expert * groups_per_row +
+                                  row * groups_per_row + k_group) * words_per_group;
+
+#pragma unroll
+    for (int kb = 0; kb < blocks_per_group; ++kb) {
+        const uint32_t * src_qs = (const uint32_t *) src_group[kb].qs;
+#pragma unroll
+        for (int w = 0; w < QK_NVFP4 / 8; ++w) {
+            dst_group[(QK_NVFP4 / 8) * kb + w] = src_qs[w];
+        }
+
+        dst_group[MMQ_ITER_K_FP4 / 8 + kb] = *((const uint32_t *) src_group[kb].d);
+    }
+}
+
+static void ggml_cuda_nvfp4_repack_mmq_active_experts_cuda(
+        const char * src, void * dst, int32_t * expert_map, const int32_t * expert_bounds,
+        const int64_t n_experts, const int64_t rows_per_expert, const int64_t groups_per_row,
+        const int64_t stride_row, const int64_t stride_channel, cudaStream_t stream) {
+    GGML_ASSERT(n_experts > 0);
+    GGML_ASSERT(rows_per_expert > 0);
+    GGML_ASSERT(groups_per_row > 0);
+
+    nvfp4_active_expert_map_kernel<<<1, 1, 0, stream>>>(expert_bounds, expert_map, n_experts);
+
+    const int64_t total_groups = n_experts * rows_per_expert * groups_per_row;
+    const int block_size = 128;
+    const dim3 block_nums((total_groups + block_size - 1) / block_size);
+    nvfp4_repack_mmq_active_experts_kernel<<<block_nums, block_size, 0, stream>>>(
+        (const block_nvfp4 *) src, (uint32_t *) dst, expert_map, n_experts, rows_per_expert, groups_per_row,
+        stride_row, stride_channel);
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -393,7 +478,8 @@ void ggml_cuda_mul_mat_q(
                                 src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_nvfp4_native_available(cc) : false;
     int64_t x_repacked_base_group = 0;
     int64_t x_repacked_ngroups = 0;
-    const bool use_repack_cache = src0->type == GGML_TYPE_NVFP4 && use_native_fp4 &&
+    const int32_t * x_repacked_expert_map = nullptr;
+    bool use_repack_cache = src0->type == GGML_TYPE_NVFP4 && use_native_fp4 &&
         ggml_cuda_nvfp4_mmq_try_repack_cache(src0, &src0_d, &x_repacked_base_group, &x_repacked_ngroups);
     if (use_repack_cache) {
         if (ggml_cuda_nvfp4_debug_enabled()) {
@@ -427,7 +513,7 @@ void ggml_cuda_mul_mat_q(
             logged = true;
         }
     }
-    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4 && ggml_cuda_nvfp4_debug_enabled()) {
+    if (!ids && src0->type == GGML_TYPE_NVFP4 && use_native_fp4 && ggml_cuda_nvfp4_debug_enabled()) {
         const int mode = (use_repack_cache ? 1 : 0) | (output_scale ? 2 : 0) | (input_scale ? 4 : 0);
         static bool logged[8] = {};
         if (!logged[mode]) {
@@ -473,6 +559,7 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1,
             use_repack_cache,
+            nullptr,
             x_repacked_base_group, x_repacked_ngroups,
             src0->name, dst->name};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
@@ -499,6 +586,65 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    ggml_cuda_pool_alloc<int32_t> active_expert_map(ctx.pool());
+    ggml_cuda_pool_alloc<char> src0_active_repack(ctx.pool());
+
+    const int active_repack_max_experts = ggml_cuda_nvfp4_active_repack_max_experts();
+    const int64_t max_active_experts = std::min<int64_t>(ne02, ne12 * n_expert_used);
+    const bool can_use_active_repack =
+        !use_repack_cache &&
+        src0->type == GGML_TYPE_NVFP4 &&
+        use_native_fp4 &&
+        active_repack_max_experts > 0 &&
+        max_active_experts > 0 &&
+        max_active_experts <= active_repack_max_experts &&
+        max_active_experts < ne02 &&
+        ne00 % MMQ_ITER_K_FP4 == 0 &&
+        ne03 == 1 &&
+        src0->view_src == nullptr &&
+        ggml_is_contiguous(src0) &&
+        s02 == ne01 * s01;
+    if (can_use_active_repack) {
+        const int64_t groups_per_row = ne00 / MMQ_ITER_K_FP4;
+        const int64_t scratch_groups = max_active_experts * ne01 * groups_per_row;
+        const size_t scratch_size = ggml_cuda_nvfp4_mmq_repack_nbytes_from_ngroups(scratch_groups);
+
+        active_expert_map.alloc(ne02);
+        src0_active_repack.alloc(scratch_size);
+        ggml_cuda_nvfp4_repack_mmq_active_experts_cuda(
+            (const char *) src0->data, src0_active_repack.get(), active_expert_map.get(), expert_bounds.get(),
+            ne02, ne01, groups_per_row, s01, s02, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_d = src0_active_repack.get();
+        use_repack_cache = true;
+        x_repacked_expert_map = active_expert_map.get();
+        x_repacked_base_group = 0;
+        x_repacked_ngroups = scratch_groups;
+
+        if (ggml_cuda_nvfp4_debug_enabled()) {
+            static bool logged = false;
+            if (!logged) {
+                GGML_LOG_INFO("CUDA NVFP4 repack cache: using active-expert MMQ sidecar scratch\n");
+                logged = true;
+            }
+        }
+    }
+
+    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4 && ggml_cuda_nvfp4_debug_enabled()) {
+        const int mode = (use_repack_cache ? 1 : 0) | (x_repacked_expert_map ? 8 : 0) |
+            (output_scale ? 2 : 0) | (input_scale ? 4 : 0);
+        static bool logged[16] = {};
+        if (!logged[mode]) {
+            GGML_LOG_INFO("CUDA NVFP4 native MMQ_ID dispatch: weights=%s, active_repack=%s, output_scale=%s, input_scale=%s\n",
+                use_repack_cache ? "repacked" : "canonical",
+                x_repacked_expert_map ? "yes" : "no",
+                output_scale ? "yes" : "no",
+                input_scale ? "yes" : "no");
+            logged[mode] = true;
+        }
     }
 
     const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_src1_nbytes(
@@ -538,6 +684,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12,
         use_repack_cache,
+        x_repacked_expert_map,
         x_repacked_base_group, x_repacked_ngroups,
         src0->name, dst->name};
 
@@ -710,6 +857,7 @@ void ggml_cuda_op_mul_mat_q(
         1, 1, 0, 0, 0,
         use_stream_k, src1_ncols,
         src0_repacked_i,
+        nullptr,
         0, x_repacked_ngroups,
         src0->name, dst->name};
 

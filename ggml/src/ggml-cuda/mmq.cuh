@@ -3718,6 +3718,7 @@ static __global__ void mul_mat_q(
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ output_scale, const int output_scale_stride,
         const float * __restrict__ input_scale, const int input_scale_stride,
+        const int32_t * __restrict__ x_repacked_expert_map,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -3801,7 +3802,18 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        int zt_x = fastdiv(zt, channel_ratio);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        if constexpr (x_repacked && type == GGML_TYPE_NVFP4) {
+            if (x_repacked_expert_map) {
+                zt_x = x_repacked_expert_map[zt];
+                if (zt_x < 0) {
+                    return;
+                }
+            }
+        }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + zt_x*stride_channel_x + it*mmq_y*stride_row_x;
         const float output_scale_value = apply_output_scale ?
             (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
             (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
@@ -3884,7 +3896,24 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        int zt_x = fastdiv(zt, channel_ratio);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        if constexpr (x_repacked && type == GGML_TYPE_NVFP4) {
+            if (x_repacked_expert_map) {
+                zt_x = x_repacked_expert_map[zt];
+                if (zt_x < 0) {
+                    kbc += blocks_per_ne00.z;
+                    kbc -= fastmodulo(kbc, blocks_per_ne00);
+
+                    kb0_start = 0;
+                    kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+
+                    continue;
+                }
+            }
+        }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + zt_x*stride_channel_x + it*mmq_y*stride_row_x;
         const float output_scale_value = apply_output_scale ?
             (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
             (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
@@ -3956,7 +3985,18 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
     const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+    int zt_x = fastdiv(zt, channel_ratio);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if constexpr (x_repacked && type == GGML_TYPE_NVFP4) {
+        if (x_repacked_expert_map) {
+            zt_x = x_repacked_expert_map[zt];
+            if (zt_x < 0) {
+                return;
+            }
+        }
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + zt_x*stride_channel_x + it*mmq_y*stride_row_x;
     const float output_scale_value = apply_output_scale ?
         (output_scale ? output_scale[output_scale_stride * zt] : 1.0f) *
         (input_scale  ? input_scale[input_scale_stride * zt] : 1.0f) : 1.0f;
@@ -4115,6 +4155,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
     bool x_repacked;
+    const int32_t * x_repacked_expert_map;
     int64_t x_repacked_base_group;
     int64_t x_repacked_ngroups;
     const char * x_name; const char * dst_name;
@@ -4448,6 +4489,7 @@ static void launch_mul_mat_q_kernel(
     mul_mat_q<type, mmq_x, need_check, apply_output_scale, x_repacked><<<block_nums, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup,
          args.output_scale, args.output_scale_stride, args.input_scale, args.input_scale_stride,
+         args.x_repacked_expert_map,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,

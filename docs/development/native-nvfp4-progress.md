@@ -23,6 +23,7 @@ This is local progress for native NVFP4 CUDA kernels without dequantizing weight
 - An opt-in CUDA-side NVFP4 MMQ repack cache is available through `GGML_CUDA_NVFP4_REPACK_CACHE_MB`. It keeps canonical GGUF/GGML tensor storage untouched and creates a budgeted per-tensor sidecar laid out as 64 packed FP4 words plus 8 scale words for each 512-value MMQ row segment. Plain CUDA buffers and CUDA split buffers are supported; compute buffers are skipped, and sidecars are marked stale on partial uploads or memset.
 - Repack sidecars now carry `base_group` and `ngroups` metadata. Current full-tensor and split-buffer sidecars use `base_group=0`, while the repacked SM120 loader subtracts the base group from the logical group index. This is a scaffold for later partial/expert-local sidecars; no sparse expert remapping is admitted yet.
 - The CUDA repacker can populate an arbitrary contiguous logical group range into the start of a sidecar. MMQ dispatch now admits a sidecar only when the current tensor's exact logical group range is covered; contiguous NVFP4 views can reuse a covered source-tensor sidecar by shifting the sidecar pointer to the view's first group.
+- `GGML_CUDA_NVFP4_ACTIVE_REPACK_MAX_EXPERTS=N` enables an experimental per-dispatch active-expert sidecar for NVFP4 `MUL_MAT_ID`. It builds the expert-to-compact-slot map on GPU from `expert_bounds`, repacks only the active expert weight slices into pool scratch, and passes that map into MMQ. The default is disabled because it trades weight-load locality for extra repack kernels and temporary memory.
 - Split-buffer NVFP4 MMQ now stages runtime activations as FP4 blocks on SM120 instead of q8_1 blocks before enabling split-buffer `x_repacked=true`.
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MAX_TENSOR_MB` optionally caps individual tensor sidecars so local runs can skip very large all-expert tensors and spend the cache budget on smaller repeated weights.
 - `GGML_CUDA_NVFP4_TRACE_MMQ=1` emits one stderr line per native NVFP4 MMQ dispatch with launch tile count, selected MMQ shape, stream-k/fixup state, scale metadata, `x_repacked` state, `ids` state, tensor dimensions, and tensor names. `GGML_CUDA_NVFP4_TRACE_MMQ=2` additionally copies MoE `expert_bounds` and reports active experts. This is intentionally opt-in because the requested benchmark emits thousands of lines.
@@ -62,6 +63,7 @@ GGML_CUDA_NVFP4_NATIVE=1 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-o
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_TRACE_MMQ=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=nvfp4'
 GGML_CUDA_NVFP4_REPACK_CACHE_MB=64 GGML_CUDA_NVFP4_DEBUG=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID -b CUDA0 -p 'type_a=nvfp4'
+GGML_CUDA_NVFP4_ACTIVE_REPACK_MAX_EXPERTS=96 GGML_CUDA_NVFP4_TRACE_MMQ=1 ./build-cuda/bin/test-backend-ops -o MUL_MAT_ID -b CUDA0 -p 'type_a=nvfp4'
 ./build-cuda/bin/test-backend-ops -o MUL_MAT -b CUDA0 -p 'type_a=mxfp4'
 ```
 
@@ -82,6 +84,7 @@ Results:
 - `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64` `MUL_MAT type_a=nvfp4`: 41/41 passed, with the debug log confirming that the sidecar MMQ weight loader was selected on eligible k=1024 cases.
 - Repack base-offset scaffold: `MUL_MAT type_a=nvfp4` 41/41 passed and `MUL_MAT_ID type_a=nvfp4` 72/72 passed with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64`.
 - Repack range-admission pass: `MUL_MAT type_a=nvfp4` 41/41 passed and `MUL_MAT_ID type_a=nvfp4` 72/72 passed with `GGML_CUDA_NVFP4_REPACK_CACHE_MB=64`; focused `MUL_MAT_NVFP4_NATIVE` and `MUL_MAT_ID_INPUT_SCALE` also passed.
+- Active-expert sidecar scratch: with `GGML_CUDA_NVFP4_ACTIVE_REPACK_MAX_EXPERTS=96`, `MUL_MAT_ID type_a=nvfp4` 73/73 passed, including the 128-expert k=1024 case. Trace confirmed `repacked=yes repack_map=yes`.
 - `GGML_CUDA_NVFP4_TRACE_MMQ=1` confirmed the eligible k=1024 sidecar path reports `repacked=yes repack_base=0 repack_groups=192`.
 - `MUL_MAT type_a=mxfp4`: 41/41 passed after the shared Blackwell FP4 dot-loop lifetime change.
 
@@ -139,6 +142,7 @@ Benchmark command:
 | Blackwell FP4 B-fragment lifetime pass | `6484.09 +/- 11.69 t/s` | `126.97 +/- 0.84 t/s` |
 | Repack base-offset sidecar metadata scaffold | `6477.28 +/- 12.13 t/s` | `126.88 +/- 0.83 t/s` |
 | Repack exact-range admission scaffold | `6478.72 +/- 12.79 t/s` | `126.73 +/- 0.81 t/s` |
+| Active-expert sidecar scratch, default disabled | `6459.71 +/- 12.99 t/s` | `126.89 +/- 0.82 t/s` |
 
 The GLU fusion path was slightly slower in this benchmark, so it remains opt-in.
 
